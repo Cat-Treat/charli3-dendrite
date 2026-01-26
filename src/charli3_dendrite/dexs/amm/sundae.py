@@ -855,11 +855,7 @@ class SundaeSwapV3StableSwap(AbstractStableSwapPoolState):
                 else:
                     values["assets"]["lovelace"] = values["assets"].pop("lovelace")
 
-            datum = SundaeV3PoolDatum.from_cbor(values["datum_cbor"])
-            values["fee"] = datum.bid_fees_per_10_thousand
-            values["assets"] = Assets.model_validate(values["assets"])
-
-            cls.get_batcher_fee()
+            cls.post_init(values)
             return True
         else:
             return False
