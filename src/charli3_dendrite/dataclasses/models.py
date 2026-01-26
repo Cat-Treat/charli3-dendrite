@@ -151,12 +151,16 @@ class ScriptReference(DendriteBaseModel):
                 output=TransactionOutput(
                     address=Address.decode(self.address),
                     amount=Value(coin=self.assets["lovelace"]),
-                    script=None
-                    if self.script is None
-                    else PlutusV2Script(bytes.fromhex(self.script)),
-                    datum=None
-                    if self.datum_cbor is None
-                    else RawPlutusData.from_cbor(self.datum_cbor),
+                    script=(
+                        None
+                        if self.script is None
+                        else PlutusV2Script(bytes.fromhex(self.script))
+                    ),
+                    datum=(
+                        None
+                        if self.datum_cbor is None
+                        else RawPlutusData.from_cbor(self.datum_cbor)
+                    ),
                 ),
             )
         else:

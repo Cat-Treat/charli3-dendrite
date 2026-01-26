@@ -1,4 +1,5 @@
 """SundaeSwap DEX module."""
+
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -12,6 +13,7 @@ from pycardano import Datum
 from pycardano import PlutusData
 from pycardano import PlutusV1Script
 from pycardano import PlutusV2Script
+from pycardano import PlutusV3Script
 from pycardano import VerificationKeyHash
 
 from charli3_dendrite.backend import get_backend
@@ -27,6 +29,7 @@ from charli3_dendrite.dataclasses.models import Assets
 from charli3_dendrite.dataclasses.models import OrderType
 from charli3_dendrite.dataclasses.models import PoolSelector
 from charli3_dendrite.dexs.amm.amm_types import AbstractConstantProductPoolState
+from charli3_dendrite.dexs.amm.amm_types import AbstractStableSwapPoolState
 from charli3_dendrite.dexs.core.errors import InvalidPoolError
 from charli3_dendrite.dexs.core.errors import NoAssetsError
 from charli3_dendrite.dexs.core.errors import NotAPoolError
@@ -427,6 +430,31 @@ class SundaeV3PoolDatum(PlutusData):
 
 
 @dataclass
+class SundaeV3StablePoolDatum(PlutusData):
+    CONSTR_ID = 0
+    ident: bytes
+    assets: List[List[bytes]]
+    circulation_lp: int
+    lp_fee_basis_points: list[int]
+    protocol_fee_basis_points: list[int]
+    fee_manager: Union[PlutusNone, Any]
+    market_open: int  # time in milliseconds
+    protocol_fees: list[int]  # [scooper fees, asset A lp_fee, asset B lp_fee]
+    amp: int
+    sum_invariant: int
+    linear_amplification_manager: Union[PlutusNone, Any]
+
+    def pool_pair(self) -> Assets | None:
+        assets = {}
+        for asset in self.assets:
+            assets[asset[0].hex() + asset[1].hex()] = 0
+        if "" in assets:
+            assets.pop("")
+            assets["lovelace"] = 0
+        return Assets(**assets)
+
+
+@dataclass
 class SundaeV3Settings(PlutusData):
     CONSTR_ID = 0
     settings_admin: Datum  # NativeScript
@@ -700,6 +728,189 @@ class SundaeSwapV3CPPState(AbstractConstantProductPoolState):
         values["fee"] = [datum.bid_fees_per_10_thousand, datum.ask_fees_per_10_thousand]
 
         cls.get_batcher_fee()
+
+    def swap_datum(
+        self,
+        address_source: Address,
+        in_assets: Assets,
+        out_assets: Assets,
+        extra_assets: Assets | None = None,
+        address_target: Address | None = None,
+        datum_target: PlutusData | None = None,
+    ) -> PlutusData:
+        if self.swap_forward and address_target is not None:
+            print(f"{self.__class__.__name__} does not support swap forwarding.")
+
+        ident = bytes.fromhex(self.pool_nft.unit()[64:])
+
+        datum = SundaeV3OrderDatum.create_datum(
+            ident=ident,
+            address_source=address_source,
+            in_assets=in_assets,
+            out_assets=out_assets,
+            fee=self.batcher_fee(in_assets=in_assets, out_assets=out_assets).quantity(),
+        )
+
+        return datum
+
+
+class SundaeSwapV3StableSwap(AbstractStableSwapPoolState):
+    _batcher = Assets(lovelace=500000)
+    _deposit = Assets(lovelace=2000000)
+    _stake_address: ClassVar[Address] = Address.from_primitive(
+        "addr1w94tv2296rvdv2ywysankephl7wqnx3cuzyz3r66dd79azc4swz8d",
+    )
+
+    _amp: int | None = None
+    _sum_invariant: int | None = None
+
+    def batcher_fee(
+        self,
+        in_assets: Assets | None = None,
+        out_assets: Assets | None = None,
+        extra_assets: Assets | None = None,
+    ) -> Assets:
+        """Batcher fee."""
+        return self.__class__._batcher_fee
+
+    @classmethod
+    def dex(cls) -> str:
+        return "SundaeSwapV3"
+
+    @classmethod
+    def default_script_class(
+        self,
+    ) -> type[PlutusV1Script] | type[PlutusV2Script] | type[PlutusV3Script]:
+        return PlutusV3Script
+
+    @classmethod
+    def order_selector(self) -> list[str]:
+        return [self._stake_address.encode()]
+
+    @classmethod
+    def pool_selector(cls) -> PoolSelector:
+        return PoolSelector(
+            addresses=["addr1w9x70xsvzuvqqv9l7npksfwtd6vu4gq8h33j77y4vx3x64s20wr4w"],
+        )
+
+    @classmethod
+    def pool_policy(cls) -> list[str]:
+        return [
+            "4de79a0c17180030bff4c36825cb6e99caa007bc632f789561a26d56",
+        ]
+
+    @property
+    def swap_forward(self) -> bool:
+        return False
+
+    @property
+    def stake_address(self) -> Address:
+        return self._stake_address
+
+    @classmethod
+    def order_datum_class(self) -> type[SundaeV3OrderDatum]:
+        return SundaeV3OrderDatum
+
+    @classmethod
+    def pool_datum_class(self) -> type[SundaeV3PoolDatum]:
+        return SundaeV3StablePoolDatum
+
+    @property
+    def pool_id(self) -> str:
+        """A unique identifier for the pool."""
+        return self.pool_nft.unit()
+
+    @classmethod
+    @lru_cache
+    def get_batcher_fee(cls, last_check: int = time.time() // 3600):
+        try:
+            settings = get_backend().get_datum_from_address(
+                address=Address.decode(
+                    "addr1w9ke67k2ckdyg60v22ajqugxze79e0ax3yqgl7nway4vc5q84hpqs",
+                ),
+                asset="6d9d7acac59a4469ec52bb207106167c5cbfa689008ffa6ee92acc5073657474696e6773",
+            )
+        except ValueError:
+            print(
+                "No settings found for SundaeSwapV3, likely because no backend is set.",
+            )
+            return
+
+        datum = SundaeV3Settings.from_cbor(settings.datum_cbor)
+        cls._batcher_fee = Assets(lovelace=datum.simple_fee + datum.base_fee)
+
+    @classmethod
+    def skip_init(cls, values) -> bool:
+        if "pool_nft" in values:
+            try:
+                super().extract_pool_nft(values)
+            except InvalidPoolError:
+                raise NotAPoolError("No pool NFT found.")
+            if len(values["assets"]) == 3:
+                # Send the ADA token to the end
+                if isinstance(values["assets"], Assets):
+                    values["assets"].root["lovelace"] = values["assets"].root.pop(
+                        "lovelace",
+                    )
+                else:
+                    values["assets"]["lovelace"] = values["assets"].pop("lovelace")
+
+            datum = SundaeV3PoolDatum.from_cbor(values["datum_cbor"])
+            values["fee"] = datum.bid_fees_per_10_thousand
+            values["assets"] = Assets.model_validate(values["assets"])
+
+            cls.get_batcher_fee()
+            return True
+        else:
+            return False
+
+    @classmethod
+    def extract_pool_nft(cls, values) -> Assets:
+        try:
+            super().extract_pool_nft(values)
+        except InvalidPoolError:
+            if len(values["assets"]) == 0:
+                raise NoAssetsError
+            else:
+                raise NotAPoolError("No pool NFT found.")
+
+    @classmethod
+    def post_init(cls, values):
+        super().post_init(values)
+
+        assets = values["assets"]
+        datum = SundaeV3StablePoolDatum.from_cbor(values["datum_cbor"])
+
+        assets.root[assets.unit(0)] -= datum.protocol_fees[1]
+        assets.root[assets.unit(1)] -= datum.protocol_fees[2]
+
+        values["fee"] = [
+            l + p
+            for l, p in zip(datum.lp_fee_basis_points, datum.protocol_fee_basis_points)
+        ]
+
+        cls.get_batcher_fee()
+
+    @property
+    def amp(self) -> int:
+        if self._amp is None:
+            self._amp = self.pool_datum.amp
+
+        return self._amp
+
+    def get_amount_out(
+        self,
+        asset: Assets,
+        precise: bool = True,
+    ) -> tuple[Assets, float]:
+        return super().get_amount_out(asset, precise=precise, fee_on_input=True)
+
+    def get_amount_in(
+        self,
+        asset: Assets,
+        precise: bool = True,
+    ) -> tuple[Assets, float]:
+        return super().get_amount_in(asset, precise=precise, fee_on_input=True)
 
     def swap_datum(
         self,

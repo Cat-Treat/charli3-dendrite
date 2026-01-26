@@ -391,9 +391,11 @@ class SpectrumCPPState(AbstractConstantProductPoolState):
             raise ValueError("pool_nft is required but is None")
 
         volume_fee = int(
-            self.volume_fee[0]
-            if isinstance(self.volume_fee, list)
-            else self.volume_fee or 0,
+            (
+                self.volume_fee[0]
+                if isinstance(self.volume_fee, list)
+                else self.volume_fee or 0
+            ),
         )
         return SpectrumOrderDatum.create_datum(
             address_source=address_source,
