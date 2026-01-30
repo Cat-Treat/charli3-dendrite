@@ -356,7 +356,12 @@ class SplashBaseState(AbstractPairState):
         if "pool_nft" in values and "lp_tokens" in values:
             order_class = cls.pool_datum_class()
             try:
-                datum: SplashSSPPoolDatum | SplashCPPPoolDatum = order_class.from_cbor(
+                datum: (
+                    SplashSSPPoolDatum
+                    | SplashCPPPoolDatum
+                    | SplashCPPRoyaltyPoolDatum
+                    | SplashCPPBidirPoolDatum
+                ) = order_class.from_cbor(
                     values["datum_cbor"],
                 )
             except DeserializeException as err:
@@ -368,6 +373,10 @@ class SplashBaseState(AbstractPairState):
                 raise NotAPoolError("Invalid LP tokens")
 
             values["assets"] = Assets.model_validate(values["assets"])
+            if len(values["assets"]) == 3:  # noqa: PLR2004
+                lovelace = values["assets"].root.pop("lovelace")
+                values["assets"].root["lovelace"] = lovelace
+
             return True
 
         return False
@@ -450,13 +459,19 @@ class SplashSSPState(SplashBaseState, AbstractCommonStableSwapPoolState):
         values["fee"] = datum.lp_fee_num + datum.protocol_fee_num
 
         assets = values["assets"]
-        assets.root[assets.unit(0)] -= datum.protocol_fee_x
-        assets.root[assets.unit(1)] -= datum.protocol_fee_y
+        assets.root[datum.asset_x.assets.unit()] -= datum.protocol_fee_x
+        assets.root[datum.asset_y.assets.unit()] -= datum.protocol_fee_y
 
-        cls.asset_mulitipliers = [
-            datum.multiplier_x,
-            datum.multiplier_y,
-        ]
+        if datum.asset_x.assets.unit() == assets.unit():
+            cls.asset_mulitipliers = [
+                datum.multiplier_x,
+                datum.multiplier_y,
+            ]
+        else:
+            cls.asset_mulitipliers = [
+                datum.multiplier_y,
+                datum.multiplier_x,
+            ]
 
         # Verify pool is active
         # TODO: should be updated to match the validator:
@@ -534,7 +549,6 @@ class SplashSSPState(SplashBaseState, AbstractCommonStableSwapPoolState):
         )
 
         # Create the pool output UTxO
-        # TODO: add protocol and fees
         assets.root[in_assets.unit()] += in_assets.quantity()
         assets.root[out_assets.unit()] -= out_assets.quantity()
         txo = TransactionOutput(
@@ -592,8 +606,8 @@ class SplashCPPState(SplashBaseState, AbstractConstantProductPoolState):
         values["fee"] = 100000 - datum.pool_fee + datum.treasury_fee
 
         assets = values["assets"]
-        assets.root[assets.unit(0)] -= datum.treasury_x
-        assets.root[assets.unit(1)] -= datum.treasury_y
+        assets.root[datum.asset_x.assets.unit()] -= datum.treasury_x
+        assets.root[datum.asset_y.assets.unit()] -= datum.treasury_y
 
         # Verify pool is active
         # TODO: should be updated to match the validator:
@@ -699,8 +713,8 @@ class SplashCPPState(SplashBaseState, AbstractConstantProductPoolState):
             self.pool_datum.to_cbor(),
         )
         assets = self.assets + self.pool_nft + self.lp_tokens
-        assets.root[self.assets.unit()] += pool_datum.treasury_x
-        assets.root[self.assets.unit(1)] += pool_datum.treasury_y
+        assets.root[pool_datum.asset_x.assets.unit()] += pool_datum.treasury_x
+        assets.root[pool_datum.asset_y.assets.unit()] += pool_datum.treasury_y
         input_utxo = UTxO(
             TransactionInput(
                 transaction_id=TransactionId(bytes.fromhex(self.tx_hash)),
@@ -781,14 +795,20 @@ class SplashCPPBidirState(SplashCPPState):
             values["datum_cbor"],
         )
 
-        values["fee"] = [
-            (100000 - datum.pool_fee_x + datum.treasury_fee),
-            (100000 - datum.pool_fee_y + datum.treasury_fee),
-        ]
+        if datum.asset_x.assets.unit() == values["assets"].unit():
+            values["fee"] = [
+                (100000 - datum.pool_fee_x + datum.treasury_fee),
+                (100000 - datum.pool_fee_y + datum.treasury_fee),
+            ]
+        else:
+            values["fee"] = [
+                (100000 - datum.pool_fee_y + datum.treasury_fee),
+                (100000 - datum.pool_fee_x + datum.treasury_fee),
+            ]
 
         assets = values["assets"]
-        assets.root[assets.unit(0)] -= datum.treasury_x
-        assets.root[assets.unit(1)] -= datum.treasury_y
+        assets.root[datum.asset_x.assets.unit()] -= datum.treasury_x
+        assets.root[datum.asset_y.assets.unit()] -= datum.treasury_y
 
         # Verify pool is active
         values["inactive"] = assets.quantity() < LIQUIDITY_THRESHOLD
@@ -832,8 +852,8 @@ class SplashCPPRoyaltyState(SplashCPPState):
         values["fee"] += datum.royalty_fee
 
         assets = values["assets"]
-        assets.root[assets.unit(0)] -= datum.royalty_x
-        assets.root[assets.unit(1)] -= datum.royalty_y
+        assets.root[datum.asset_x.assets.unit()] -= datum.royalty_x
+        assets.root[datum.asset_y.assets.unit()] -= datum.royalty_y
 
     def swap_utxo(
         self,
@@ -878,10 +898,10 @@ class SplashCPPRoyaltyState(SplashCPPState):
             self.pool_datum.to_cbor(),
         )
         assets = self.assets + self.pool_nft + self.lp_tokens
-        assets.root[self.assets.unit()] += (
+        assets.root[pool_datum.asset_x.assets.unit()] += (
             pool_datum.treasury_x + self.pool_datum.royalty_x
         )
-        assets.root[self.assets.unit(1)] += (
+        assets.root[pool_datum.asset_y.assets.unit()] += (
             pool_datum.treasury_y + self.pool_datum.royalty_y
         )
         input_utxo = UTxO(

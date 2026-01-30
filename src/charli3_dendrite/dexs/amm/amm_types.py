@@ -1,4 +1,5 @@
 """Module providing types and state classes for AMM pools."""
+
 import math
 from typing import ClassVar
 

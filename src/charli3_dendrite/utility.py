@@ -1,4 +1,5 @@
 """Utility functions for handling asset information."""
+
 import json
 from datetime import datetime
 from datetime import timedelta

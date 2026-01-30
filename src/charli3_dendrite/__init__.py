@@ -17,6 +17,7 @@ from charli3_dendrite.dexs.amm.splash import SplashCPPState
 from charli3_dendrite.dexs.amm.splash import SplashSSPState
 from charli3_dendrite.dexs.amm.sundae import SundaeSwapCPPState
 from charli3_dendrite.dexs.amm.sundae import SundaeSwapV3CPPState
+from charli3_dendrite.dexs.amm.sundae import SundaeSwapV3StableSwap
 from charli3_dendrite.dexs.amm.vyfi import VyFiCPPState
 from charli3_dendrite.dexs.amm.wingriders import WingRidersCPPState
 from charli3_dendrite.dexs.amm.wingriders import WingRidersSSPState
