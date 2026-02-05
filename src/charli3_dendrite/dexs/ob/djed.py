@@ -5,6 +5,7 @@ and Shen (liquidity token) operations, following the exact patterns established
 by the GeniusYield implementation.
 """
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -74,6 +75,11 @@ def _finalize_order_tx(
         datum_hash=pool_datum.hash(),
     )
     tx_builder.add_output(pool_datum_hash_output)
+
+    # Add pool datum to witness set (required when output uses datum_hash)
+    if tx_builder.datums is None:
+        tx_builder.datums = {}
+    tx_builder.datums[pool_datum.hash()] = pool_datum
 
     # Add user as required signer
     if tx_builder.required_signers is None:
@@ -380,8 +386,12 @@ class DjedShenOrderStateBase(AbstractOrderState):
     datum_hash: str
     inactive: bool = False
 
-    _batcher_fee: Assets = Assets(lovelace=2_000_000)  # 2 ADA operator fee
+    # Operator fee: min 5.15 ADA, max 25 ADA, typically ada_amount/400
+    _batcher_fee: Assets = Assets(lovelace=5_150_000)
     _datum_parsed: PlutusData | None = None
+    # Deposit: min_ada for order contract + min_ada for datum hash output
+    # Typical min_ada is 2 ADA, so ~4 ADA total deposit
+    _deposit: Assets = Assets(lovelace=4_000_000)
 
     @classmethod
     def dex_policy(cls) -> list[str] | None:
@@ -1031,7 +1041,7 @@ class DjedShenOrderBookBase(AbstractOrderBookState):
     """
 
     fee: int = 150  # 1.5% fee in basis points
-    _deposit: Assets = Assets(lovelace=2_000_000)
+    _deposit: Assets = Assets(lovelace=4_000_000)
 
     @classmethod
     def order_selector(cls) -> list[str]:
@@ -1264,10 +1274,10 @@ class DjedOrderBook(DjedShenOrderBookBase):
 
         oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
 
-        # Calculate ADA needed: amount * (denom/num) * (1 + 1.5% fee)
-        ada_amount = (amount * oracle_rate.denominator * 1015) // (
-            oracle_rate.numerator * 1000
-        )
+        # Calculate ADA needed: ceil(amount * (denom/num) * 1.015)
+        numerator = amount * oracle_rate.denominator * 1015
+        denominator = oracle_rate.numerator * 1000
+        ada_amount = math.ceil(numerator / denominator)
 
         operator_fee = max(5_150_000, min(25_000_000, ada_amount * 1 // 400))
 
@@ -1506,16 +1516,18 @@ class ShenOrderBook(DjedShenOrderBookBase):
 
         oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
 
-        # Calculate Shen price (excess ADA per Shen)
-        djed_backing_ada = (
-            pool_datum.djed_in_circulation * oracle_rate.denominator
-        ) // oracle_rate.numerator
-        excess_ada = pool_datum.ada_in_reserve - djed_backing_ada
-
-        # Calculate ADA needed: (amount * excess_ada / shen_in_circulation) * 1.015 fee
-        ada_amount = (amount * excess_ada * 1015) // (
-            pool_datum.shen_in_circulation * 1000
+        # Calculate ADA needed using rational arithmetic (avoids precision loss).
+        # Formula uses ceiling division to match open-djed TypeScript behavior.
+        numerator = (
+            amount
+            * (
+                pool_datum.ada_in_reserve * oracle_rate.numerator
+                - pool_datum.djed_in_circulation * oracle_rate.denominator
+            )
+            * 1015
         )
+        denominator = oracle_rate.numerator * pool_datum.shen_in_circulation * 1000
+        ada_amount = math.ceil(numerator / denominator)
 
         # Calculate operator fee
         operator_fee = max(5_150_000, min(25_000_000, ada_amount * 1 // 400))
