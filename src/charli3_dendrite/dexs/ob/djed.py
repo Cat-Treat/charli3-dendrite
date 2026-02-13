@@ -8,7 +8,7 @@ by the GeniusYield implementation.
 import math
 import time
 from dataclasses import dataclass
-from typing import Any
+from fractions import Fraction
 from typing import Union
 
 from pycardano import Address
@@ -21,6 +21,8 @@ from pycardano import TransactionId
 from pycardano import TransactionInput
 from pycardano import TransactionOutput
 from pycardano import UTxO
+from pycardano import Value
+from pycardano import min_lovelace
 
 from charli3_dendrite.backend import get_backend
 from charli3_dendrite.dataclasses.datums import OrderDatum
@@ -29,7 +31,6 @@ from charli3_dendrite.dataclasses.models import Assets
 from charli3_dendrite.dataclasses.models import OrderType
 from charli3_dendrite.dataclasses.models import PoolSelector
 from charli3_dendrite.dexs.ob.ob_base import AbstractOrderBookState
-from charli3_dendrite.dexs.ob.ob_base import AbstractOrderState
 from charli3_dendrite.dexs.ob.ob_base import BuyOrderBook
 from charli3_dendrite.dexs.ob.ob_base import OrderBookOrder
 from charli3_dendrite.dexs.ob.ob_base import SellOrderBook
@@ -49,53 +50,21 @@ POOL_NFT = (
     "446a6564537461626c65436f696e4e4654"
 )
 ORDER_NFT_POLICY = "04ea363a127872366ef2d3186325a25a5cee8826ff8a79dc7c8fa671"
+ORDER_NFT_NAME_HEX = "446a65644f726465725469636b6574"
 
 # Shelley mainnet genesis parameters - Necessary for order datum creation
 SHELLEY_START_POSIX = 1596491091  # Unix timestamp when Shelley started
 SHELLEY_START_SLOT = 4924800  # Slot number when Shelley started
+MIN_RESERVE_RATIO_PERCENT = 400
+MAX_RESERVE_RATIO_PERCENT = 800
+MIN_ORDER_AMOUNT = 50_000_000
+FEE_NUMERATOR = 15
+FEE_DENOMINATOR = 1000
 
 
 def _slot_to_posix_ms(slot: int) -> int:
     """Convert a Cardano slot number to POSIX milliseconds (mainnet only)."""
     return (slot - SHELLEY_START_SLOT + SHELLEY_START_POSIX) * 1000
-
-
-def _finalize_order_tx(
-    tx_builder: TransactionBuilder,
-    user_address: Address,
-    pool_datum: "DjedPoolDatum",
-    minting_policy_ref: UTxO,
-    order_nft_unit: str,
-) -> None:
-    """Add common order transaction components (pool datum output, signer, mint NFT)."""
-    # Add pool datum hash output to user's address (required by minting script)
-    pool_datum_hash_output = TransactionOutput(
-        address=user_address,
-        amount=asset_to_value(Assets(lovelace=2_000_000)),
-        datum_hash=pool_datum.hash(),
-    )
-    tx_builder.add_output(pool_datum_hash_output)
-
-    # Add pool datum to witness set (required when output uses datum_hash)
-    if tx_builder.datums is None:
-        tx_builder.datums = {}
-    tx_builder.datums[pool_datum.hash()] = pool_datum
-
-    # Add user as required signer
-    if tx_builder.required_signers is None:
-        tx_builder.required_signers = []
-    tx_builder.required_signers.append(user_address.payment_part)
-
-    # Mint the order NFT (+1)
-    tx_builder.add_minting_script(
-        script=minting_policy_ref,
-        redeemer=Redeemer(DjedOrderMintRedeemer()),
-    )
-    mint_assets = Assets(**{order_nft_unit: 1})
-    if tx_builder.mint is None:
-        tx_builder.mint = asset_to_value(mint_assets).multi_asset
-    else:
-        tx_builder.mint += asset_to_value(mint_assets).multi_asset
 
 
 @dataclass
@@ -373,145 +342,71 @@ class DjedOrderDatum(OrderDatum):
         return OrderType.swap  # Burning = swap operation
 
 
-class DjedShenOrderStateBase(AbstractOrderState):
-    """Base class for Djed/Shen order states sharing common functionality.
+def _calculate_operator_fee(ada_amount: int) -> int:
+    """Calculate Djed operator fee based on ADA amount.
 
-    Reduces code duplication between Djed and Shen implementations by providing
-    shared methods that follow the exact GeniusYield pattern.
+    Fee is 0.25% (1/400) of the ADA amount, clamped between min and max.
     """
+    return max(5_150_000, min(25_000_000, ada_amount // 400))
 
-    tx_hash: str
-    tx_index: int
-    datum_cbor: str
-    datum_hash: str
-    inactive: bool = False
 
-    # Operator fee: min 5.15 ADA, max 25 ADA, typically ada_amount/400
-    _batcher_fee: Assets = Assets(lovelace=5_150_000)
-    _datum_parsed: PlutusData | None = None
-    # Deposit: min_ada for order contract + min_ada for datum hash output
-    # Typical min_ada is 2 ADA, so ~4 ADA total deposit
-    _deposit: Assets = Assets(lovelace=4_000_000)
+def _finalize_order_tx(
+    tx_builder: TransactionBuilder,
+    user_address: Address,
+    pool_datum: "DjedPoolDatum",
+    minting_policy_ref: UTxO,
+) -> None:
+    """Add common order transaction components (pool datum output, signer, mint NFT)."""
+    # Add pool datum hash output to user's address (required by minting script)
+    pool_datum_hash_output = TransactionOutput(
+        address=user_address,
+        amount=asset_to_value(Assets(lovelace=0)),
+        datum_hash=pool_datum.hash(),
+    )
+    pool_datum_hash_output.amount.coin = min_lovelace(
+        tx_builder.context,
+        output=pool_datum_hash_output,
+    )
+    tx_builder.add_output(pool_datum_hash_output)
 
-    @classmethod
-    def dex_policy(cls) -> list[str] | None:
-        """Djed/Shen order NFT policy IDs (following GeniusYield pattern)."""
-        return [ORDER_NFT_POLICY]
+    # Add pool datum to witness set (required when output uses datum_hash)
+    if tx_builder.datums is None:
+        tx_builder.datums = {}
+    tx_builder.datums[pool_datum.hash()] = pool_datum
 
-    @classmethod
-    def djed_asset(cls) -> str:
-        """Djed token asset ID (mainnet)."""
-        return DJED_TOKEN
+    # Add user as required signer
+    if tx_builder.required_signers is None:
+        tx_builder.required_signers = []
+    tx_builder.required_signers.append(user_address.payment_part)
 
-    @classmethod
-    def shen_asset(cls) -> str:
-        """Shen token asset ID (mainnet)."""
-        return SHEN_TOKEN
+    # Mint the order NFT (+1)
+    tx_builder.add_minting_script(
+        script=minting_policy_ref,
+        redeemer=Redeemer(DjedOrderMintRedeemer()),
+    )
+    mint_assets = Assets(**{ORDER_NFT_POLICY + ORDER_NFT_NAME_HEX: 1})
+    if tx_builder.mint is None:
+        tx_builder.mint = asset_to_value(mint_assets).multi_asset
+    else:
+        tx_builder.mint += asset_to_value(mint_assets).multi_asset
 
-    @property
-    def volume_fee(self) -> float:
-        """Fee percentage for operations (following GeniusYield pattern)."""
-        return 150  # 1.5% in basis points
 
-    @property
-    def reference_utxo(self) -> UTxO | None:
-        """Get reference UTxO for script validation (following GeniusYield pattern)."""
-        order_info = get_backend().get_pool_in_tx(
-            self.tx_hash,
-            assets=[self.dex_nft.unit()],
-            addresses=self.pool_selector().addresses,
-        )
+class DjedShenOrderBookBase(AbstractOrderBookState):
+    """Base class for Djed/Shen order books sharing common functionality."""
 
-        script = get_backend().get_script_from_address(
-            Address.decode(order_info[0].address),
-        )
-
-        return UTxO(
-            input=TransactionInput(
-                TransactionId(bytes.fromhex(script.tx_hash)),
-                index=script.tx_index,
-            ),
-            output=TransactionOutput(
-                address=script.address,
-                amount=asset_to_value(script.assets),
-                script=PlutusV2Script(bytes.fromhex(script.script)),
-            ),
-        )
-
-    def _get_pool_utxo(self) -> UTxO:
-        """Get pool UTxO using backend (shared by both Djed and Shen)."""
-        selector = self.pool_selector()
-        pool_utxos = get_backend().get_pool_utxos(
-            limit=1,
-            historical=False,
-            **selector.model_dump(),
-        )
-        if not pool_utxos:
-            raise RuntimeError("Pool UTxO not found")
-
-        pool_info = pool_utxos[0]
-        return UTxO(
-            input=TransactionInput(
-                TransactionId(bytes.fromhex(pool_info.tx_hash)),
-                index=pool_info.tx_index,
-            ),
-            output=TransactionOutput(
-                address=Address.decode(pool_info.address),
-                amount=asset_to_value(pool_info.assets),
-            ),
-        )
-
-    def _get_oracle_utxo(self) -> UTxO:
-        """Get oracle UTxO using backend (shared by both Djed and Shen)."""
-        selector = self.oracle_selector()
-        oracle_utxos = get_backend().get_pool_utxos(
-            limit=1,
-            historical=False,
-            **selector.model_dump(),
-        )
-        if not oracle_utxos:
-            raise RuntimeError("Oracle UTxO not found")
-
-        oracle_info = oracle_utxos[0]
-        return UTxO(
-            input=TransactionInput(
-                TransactionId(bytes.fromhex(oracle_info.tx_hash)),
-                index=oracle_info.tx_index,
-            ),
-            output=TransactionOutput(
-                address=Address.decode(oracle_info.address),
-                amount=asset_to_value(oracle_info.assets),
-            ),
-        )
-
-    @classmethod
-    def post_init(cls, values: dict[str, Any]) -> None:
-        """Post initialization validation (shared logic)."""
-        super().post_init(values)
-
-        # Parse and validate order datum
-        try:
-            datum = cls.order_datum_class().from_cbor(values["datum_cbor"])
-
-            # Check if order is expired (3-minute TTL)
-            current_time = int(time.time())
-            if current_time > datum.creation_time + 180:  # 3 minutes
-                values["inactive"] = True
-
-        except (ValueError, KeyError):
-            values["inactive"] = True
+    fee: int = 150  # 1.5% fee in basis points
+    _deposit: Assets = Assets(lovelace=3_000_000)
 
     @classmethod
     def order_selector(cls) -> list[str]:
-        """Order contract addresses (shared)."""
+        """Order contract address (shared)."""
         return [
-            "addr1wypp5vhw2csaf62d78vmaa4652z20nr4hfgmkhacqnrvgug2vdyq4",  # mainnet
+            "addr1wypp5vhw2csaf62d78vmaa4652z20nr4hfgmkhacqnrvgug2vdyq4",
         ]
 
     @classmethod
     def pool_selector(cls) -> PoolSelector:
         """Pool selection for Djed/Shen orders (shared)."""
-        # mainnet pool address
         pool_addr = (
             "addr1z8mcpc26j64fmhhd6sv5qj5mk9xqnfxgm6k8zmk7h2rlu4"
             "qm5kjdmrpmng059yellupyvwgay2v0lz6663swmds7hp0qhxg9gt"
@@ -524,7 +419,6 @@ class DjedShenOrderStateBase(AbstractOrderState):
     @classmethod
     def oracle_selector(cls) -> PoolSelector:
         """Oracle selection for Djed/Shen (shared)."""
-        # mainnet oracle NFT
         oracle_nft = (
             "815aca02042ba9188a2ca4f8ce7b276046e2376b4bce56391342299e"
             "446a65644f7261636c654e4654"
@@ -534,549 +428,15 @@ class DjedShenOrderStateBase(AbstractOrderState):
             assets=[oracle_nft],
         )
 
-    @property
-    def swap_forward(self) -> bool:
-        """Returns if swap forwarding is enabled."""
-        return False
-
-    @property
-    def stake_address(self) -> Address | None:
-        """Return the staking address."""
-        return None
+    @classmethod
+    def djed_asset(cls) -> str:
+        """Return the DJED asset ID."""
+        return DJED_TOKEN
 
     @classmethod
-    def order_datum_class(cls) -> type[PlutusData]:
-        """Returns data class used for handling order datums."""
-        return DjedOrderDatum
-
-    @classmethod
-    def default_script_class(cls) -> type[PlutusV1Script] | type[PlutusV2Script]:
-        """Get default script class."""
-        return PlutusV2Script
-
-    @property
-    def pool_id(self) -> str:
-        """A unique identifier for the pool or ob."""
-        return "Djed"
-
-
-class DjedOrderState(DjedShenOrderStateBase):
-    """Djed order state handling Djed mint/burn operations.
-
-    Inherits common functionality from DjedShenOrderStateBase and implements
-    Djed-specific pricing and transaction logic.
-    """
-
-    @classmethod
-    def dex(cls) -> str:
-        """Official dex name."""
-        return "Djed"
-
-    @property
-    def price(self) -> tuple[int, int]:
-        """Price for Djed operations (ADA per Djed).
-
-        Oracle rate is USD/ADA (= DJED/ADA since DJED is pegged to $1).
-        We invert to get ADA/DJED, then apply fee multiplier.
-        """
-        oracle = self.order_datum.oracle_rate
-        if isinstance(self.order_datum.action, DjedMintAction):
-            # Inverted rate with 1.5% fee: (denom * 1015) / (num * 1000)
-            return (oracle.denominator * 1015, oracle.numerator * 1000)
-        # DjedBurnAction - Inverted rate with 1.5% fee deduction
-        return (oracle.denominator * 985, oracle.numerator * 1000)
-
-    @property
-    def available(self) -> Assets:
-        """Available amount for Djed orders."""
-        if isinstance(self.order_datum.action, DjedMintAction):
-            return Assets(**{DJED_TOKEN: self.order_datum.action.djed_amount})
-        # DjedBurnAction - Calculate ADA to return based on current oracle rate
-        ada_amount = self._calculate_ada_return(self.order_datum.action.djed_amount)
-        return Assets(lovelace=ada_amount)
-
-    def _calculate_ada_return(self, djed_amount: int) -> int:
-        """Calculate ADA to return for Djed burning.
-
-        Formula: djed_amount * (inverted_rate) * (1 - 1.5% fee)
-               = djed_amount * (denom/num) * (985/1000)
-               = (djed_amount * denom * 985) // (num * 1000)
-        """
-        oracle = self.order_datum.oracle_rate
-        return (djed_amount * oracle.denominator * 985) // (oracle.numerator * 1000)
-
-    def swap_utxo(
-        self,
-        address_source: Address,
-        in_assets: Assets,
-        out_assets: Assets,
-        tx_builder: TransactionBuilder,
-        extra_assets: Assets | None = None,
-        address_target: Address | None = None,
-        datum_target: PlutusData | None = None,
-    ) -> tuple[TransactionOutput | None, PlutusData]:
-        """Build transaction for Djed order processing."""
-        # Get reference UTxOs (using shared methods)
-        pool_utxo = self._get_pool_utxo()
-        oracle_utxo = self._get_oracle_utxo()
-
-        # Add order UTxO as script input (following GeniusYield pattern)
-        assets = self.assets + Assets(**{self.dex_nft.unit(): 1})
-        order_utxo = UTxO(
-            TransactionInput(
-                transaction_id=TransactionId(bytes.fromhex(self.tx_hash)),
-                index=self.tx_index,
-            ),
-            output=TransactionOutput(
-                address=Address.decode(self.address),
-                amount=asset_to_value(assets),
-                datum_hash=self.order_datum.hash(),
-            ),
-        )
-
-        # Add script input with redeemer
-        if out_assets.quantity() < self.available.quantity():
-            redeemer = Redeemer(self._get_partial_redeemer(out_assets))
-        else:
-            redeemer = Redeemer(self._get_complete_redeemer())
-
-        tx_builder.add_script_input(
-            utxo=order_utxo,
-            script=self.reference_utxo,
-            redeemer=redeemer,
-        )
-
-        # Add reference inputs
-        tx_builder.reference_inputs.add(pool_utxo)
-        tx_builder.reference_inputs.add(oracle_utxo)
-
-        # Process based on Djed operation type
-        if isinstance(self.order_datum.action, DjedMintAction):
-            return self._process_djed_mint(tx_builder, in_assets, out_assets, pool_utxo)
-        # DjedBurnAction
-        return self._process_djed_burn(tx_builder, in_assets, out_assets, pool_utxo)
-
-    def _process_djed_mint(
-        self,
-        tx_builder: TransactionBuilder,
-        in_assets: Assets,
-        out_assets: Assets,
-        pool_utxo: UTxO,
-    ) -> tuple[TransactionOutput | None, PlutusData]:
-        """Process Djed minting order."""
-        # Update order datum if partial fill
-        order_datum = self.order_datum_class().from_cbor(self.order_datum.to_cbor())
-        order_datum.action.djed_amount -= out_assets.quantity()
-
-        # Update pool state with new Djed tokens
-        updated_assets = self.assets.copy()
-        updated_assets.root[in_assets.unit()] += in_assets.quantity()
-        updated_assets.root[out_assets.unit()] -= out_assets.quantity()
-        updated_assets += self._batcher_fee
-
-        if out_assets.quantity() < self.available.quantity():
-            # Partial fill - return updated order
-            txo = TransactionOutput(
-                address=Address.decode(self.address),
-                amount=asset_to_value(updated_assets),
-                datum_hash=order_datum.hash(),
-            )
-        else:
-            # Complete fill - pay user and close order
-            # Burn the beacon token using OrderBurnRedeemer (CONSTR_ID = 1)
-            tx_builder.add_minting_script(
-                script=self.reference_utxo,
-                redeemer=Redeemer(DjedCancelOrderRedeemer()),
-            )
-            if tx_builder.mint is None:
-                tx_builder.mint = asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-            else:
-                tx_builder.mint += asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-
-            # Pay Djed tokens to user
-            payment_assets = Assets(**{out_assets.unit(): out_assets.quantity()})
-            payment_assets += Assets(lovelace=2_000_000)  # Min ADA
-
-            txo = TransactionOutput(
-                address=order_datum.owner_address.to_address(),
-                amount=asset_to_value(payment_assets),
-            )
-
-        tx_builder.datums.update({order_datum.hash(): order_datum})
-        return txo, order_datum
-
-    def _process_djed_burn(
-        self,
-        tx_builder: TransactionBuilder,
-        in_assets: Assets,
-        out_assets: Assets,
-        pool_utxo: UTxO,
-    ) -> tuple[TransactionOutput | None, PlutusData]:
-        """Process Djed burning order."""
-        # Similar to mint but burning Djed for ADA
-        order_datum = self.order_datum_class().from_cbor(self.order_datum.to_cbor())
-        order_datum.action.djed_amount -= in_assets.quantity()
-
-        # Update pool state
-        updated_assets = self.assets.copy()
-        updated_assets.root[in_assets.unit()] -= in_assets.quantity()
-        updated_assets.root[out_assets.unit()] += out_assets.quantity()
-        updated_assets += self._batcher_fee
-
-        if in_assets.quantity() < self.available.quantity():
-            # Partial fill
-            txo = TransactionOutput(
-                address=Address.decode(self.address),
-                amount=asset_to_value(updated_assets),
-                datum_hash=order_datum.hash(),
-            )
-        else:
-            # Complete fill - close order and pay ADA
-            # Burn the beacon token using OrderBurnRedeemer (CONSTR_ID = 1)
-            tx_builder.add_minting_script(
-                script=self.reference_utxo,
-                redeemer=Redeemer(DjedCancelOrderRedeemer()),
-            )
-            if tx_builder.mint is None:
-                tx_builder.mint = asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-            else:
-                tx_builder.mint += asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-
-            # Pay ADA to user
-            payment_assets = Assets(lovelace=out_assets.quantity())
-
-            txo = TransactionOutput(
-                address=order_datum.owner_address.to_address(),
-                amount=asset_to_value(payment_assets),
-            )
-
-        tx_builder.datums.update({order_datum.hash(): order_datum})
-        return txo, order_datum
-
-    def _get_partial_redeemer(self, out_assets: Assets) -> PlutusData:
-        """Get redeemer for partial order processing."""
-        return DjedProcessOrderRedeemer()
-
-    def _get_complete_redeemer(self) -> PlutusData:
-        """Get redeemer for complete order processing."""
-        return DjedProcessOrderRedeemer()
-
-
-class ShenOrderState(DjedShenOrderStateBase):
-    """Shen order state handling Shen mint/burn operations.
-
-    Inherits common functionality from DjedShenOrderStateBase and implements
-    Shen-specific pricing and transaction logic. Shen pricing is more complex
-    as it depends on pool reserves and collateral ratios.
-    """
-
-    @classmethod
-    def dex(cls) -> str:
-        """Official dex name."""
-        return "Shen"
-
-    @property
-    def price(self) -> tuple[int, int]:
-        """Price for Shen operations (more complex - requires pool state)."""
-        return self._calculate_shen_price()
-
-    @property
-    def available(self) -> Assets:
-        """Available amount for Shen orders."""
-        if isinstance(self.order_datum.action, ShenMintAction):
-            return Assets(**{SHEN_TOKEN: self.order_datum.action.shen_amount})
-        # ShenBurnAction
-        ada_amount = self._calculate_shen_ada_return(
-            self.order_datum.action.shen_amount,
-        )
-        return Assets(lovelace=ada_amount)
-
-    def _get_pool_datum(self) -> DjedPoolDatum | None:
-        """Parse pool datum from pool UTxO."""
-        try:
-            pool_utxo = self._get_pool_utxo()
-            if pool_utxo.output.datum:
-                return DjedPoolDatum.from_cbor(pool_utxo.output.datum.to_cbor())
-        except (RuntimeError, ValueError):
-            pass
-        return None
-
-    def _get_oracle_datum(self) -> DjedOracleDatum | None:
-        """Parse oracle datum from oracle UTxO."""
-        try:
-            oracle_utxo = self._get_oracle_utxo()
-            if oracle_utxo.output.datum:
-                return DjedOracleDatum.from_cbor(oracle_utxo.output.datum.to_cbor())
-        except (RuntimeError, ValueError):
-            pass
-        return None
-
-    def _calculate_shen_price(self) -> tuple[int, int]:
-        """Calculate Shen price based on current pool state.
-
-        Shen price is determined by the excess ADA reserves beyond what's needed
-        to back the Djed tokens. This is more complex than Djed pricing.
-        Formula: (adaInReserve - djedInCirculation * djedADARate) / shenInCirculation
-        """
-        try:
-            pool_datum = self._get_pool_datum()
-            oracle_datum = self._get_oracle_datum()
-
-            if not pool_datum or not oracle_datum:
-                return (1, 1)  # Fallback if datums unavailable
-
-            # Get oracle rate (stored as denominator/numerator)
-            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
-
-            djed_backing_ada = (
-                pool_datum.djed_in_circulation * oracle_rate.denominator
-            ) // oracle_rate.numerator
-
-            # Calculate excess ADA
-            excess_ada = pool_datum.ada_in_reserve - djed_backing_ada
-
-            if pool_datum.shen_in_circulation == 0:
-                return (1, 1)  # No Shen in circulation
-
-            # Return as rational (excess_ada, shen_in_circulation)
-            # Apply 1.5% fee for minting
-            if isinstance(self.order_datum.action, ShenMintAction):
-                return (excess_ada * 1015, pool_datum.shen_in_circulation * 1000)
-            # ShenBurnAction - deduct fee
-            return (excess_ada * 985, pool_datum.shen_in_circulation * 1000)
-
-        except (RuntimeError, ValueError):
-            return (1, 1)  # Fallback price
-
-    def _calculate_shen_ada_return(self, shen_amount: int) -> int:
-        """Calculate ADA to return for Shen burning.
-
-        Based on Shen's share of excess reserves beyond Djed backing,
-        minus the 1.5% burn fee.
-        """
-        try:
-            pool_datum = self._get_pool_datum()
-            oracle_datum = self._get_oracle_datum()
-
-            if not pool_datum or not oracle_datum:
-                return shen_amount  # Fallback
-
-            # Get oracle rate
-            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
-
-            # Calculate excess ADA
-            djed_backing_ada = (
-                pool_datum.djed_in_circulation * oracle_rate.denominator
-            ) // oracle_rate.numerator
-            excess_ada = pool_datum.ada_in_reserve - djed_backing_ada
-
-            if pool_datum.shen_in_circulation == 0:
-                return shen_amount  # Fallback
-
-            # Calculate ADA return = (shen_amount / total_shen) * excess_ada * (1 - fee)
-            # = shen_amount * excess_ada * 985 / (shen_in_circulation * 1000)
-            return (shen_amount * excess_ada * 985) // (
-                pool_datum.shen_in_circulation * 1000
-            )
-
-        except (RuntimeError, ValueError):
-            return shen_amount  # Fallback
-
-    def swap_utxo(
-        self,
-        address_source: Address,
-        in_assets: Assets,
-        out_assets: Assets,
-        tx_builder: TransactionBuilder,
-        extra_assets: Assets | None = None,
-        address_target: Address | None = None,
-        datum_target: PlutusData | None = None,
-    ) -> tuple[TransactionOutput | None, PlutusData]:
-        """Build transaction for Shen order processing."""
-        # Get reference UTxOs (using shared methods)
-        pool_utxo = self._get_pool_utxo()
-        oracle_utxo = self._get_oracle_utxo()
-
-        assets = self.assets + Assets(**{self.dex_nft.unit(): 1})
-        order_utxo = UTxO(
-            TransactionInput(
-                transaction_id=TransactionId(bytes.fromhex(self.tx_hash)),
-                index=self.tx_index,
-            ),
-            output=TransactionOutput(
-                address=Address.decode(self.address),
-                amount=asset_to_value(assets),
-                datum_hash=self.order_datum.hash(),
-            ),
-        )
-
-        redeemer = Redeemer(DjedProcessOrderRedeemer())
-
-        tx_builder.add_script_input(
-            utxo=order_utxo,
-            script=self.reference_utxo,
-            redeemer=redeemer,
-        )
-
-        # Add reference inputs
-        tx_builder.reference_inputs.add(pool_utxo)
-        tx_builder.reference_inputs.add(oracle_utxo)
-
-        # Process based on Shen operation type
-        if isinstance(self.order_datum.action, ShenMintAction):
-            return self._process_shen_mint(tx_builder, in_assets, out_assets, pool_utxo)
-        # ShenBurnAction
-        return self._process_shen_burn(tx_builder, in_assets, out_assets, pool_utxo)
-
-    def _process_shen_mint(
-        self,
-        tx_builder: TransactionBuilder,
-        in_assets: Assets,
-        out_assets: Assets,
-        pool_utxo: UTxO,
-    ) -> tuple[TransactionOutput | None, PlutusData]:
-        """Process Shen minting order."""
-        order_datum = self.order_datum_class().from_cbor(self.order_datum.to_cbor())
-        order_datum.action.shen_amount -= out_assets.quantity()
-
-        updated_assets = self.assets.copy()
-        updated_assets.root[in_assets.unit()] += in_assets.quantity()
-        updated_assets.root[out_assets.unit()] -= out_assets.quantity()
-        updated_assets += self._batcher_fee
-
-        if out_assets.quantity() < self.available.quantity():
-            txo = TransactionOutput(
-                address=Address.decode(self.address),
-                amount=asset_to_value(updated_assets),
-                datum_hash=order_datum.hash(),
-            )
-        else:
-            # Complete fill - burn beacon token
-            tx_builder.add_minting_script(
-                script=self.reference_utxo,
-                redeemer=Redeemer(DjedCancelOrderRedeemer()),
-            )
-            if tx_builder.mint is None:
-                tx_builder.mint = asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-            else:
-                tx_builder.mint += asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-
-            payment_assets = Assets(**{out_assets.unit(): out_assets.quantity()})
-            payment_assets += Assets(lovelace=2_000_000)
-
-            txo = TransactionOutput(
-                address=order_datum.owner_address.to_address(),
-                amount=asset_to_value(payment_assets),
-            )
-
-        tx_builder.datums.update({order_datum.hash(): order_datum})
-        return txo, order_datum
-
-    def _process_shen_burn(
-        self,
-        tx_builder: TransactionBuilder,
-        in_assets: Assets,
-        out_assets: Assets,
-        pool_utxo: UTxO,
-    ) -> tuple[TransactionOutput | None, PlutusData]:
-        """Process Shen burning order."""
-        order_datum = self.order_datum_class().from_cbor(self.order_datum.to_cbor())
-        order_datum.action.shen_amount -= in_assets.quantity()
-
-        updated_assets = self.assets.copy()
-        updated_assets.root[in_assets.unit()] -= in_assets.quantity()
-        updated_assets.root[out_assets.unit()] += out_assets.quantity()
-        updated_assets += self._batcher_fee
-
-        if in_assets.quantity() < self.available.quantity():
-            txo = TransactionOutput(
-                address=Address.decode(self.address),
-                amount=asset_to_value(updated_assets),
-                datum_hash=order_datum.hash(),
-            )
-        else:
-            # Complete fill - burn beacon token
-            tx_builder.add_minting_script(
-                script=self.reference_utxo,
-                redeemer=Redeemer(DjedCancelOrderRedeemer()),
-            )
-            if tx_builder.mint is None:
-                tx_builder.mint = asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-            else:
-                tx_builder.mint += asset_to_value(
-                    Assets(**{self.dex_nft.unit(): -1}),
-                ).multi_asset
-
-            payment_assets = Assets(lovelace=out_assets.quantity())
-
-            txo = TransactionOutput(
-                address=order_datum.owner_address.to_address(),
-                amount=asset_to_value(payment_assets),
-            )
-
-        tx_builder.datums.update({order_datum.hash(): order_datum})
-        return txo, order_datum
-
-
-class DjedShenOrderBookBase(AbstractOrderBookState):
-    """Base class for Djed/Shen order books sharing common functionality.
-
-    Djed/Shen uses an order-based system modeled as an order book:
-    - buy() creates a mint order (user sends ADA, requests tokens)
-    - sell() creates a burn order (user sends tokens, requests ADA)
-    """
-
-    fee: int = 150  # 1.5% fee in basis points
-    _deposit: Assets = Assets(lovelace=4_000_000)
-
-    @classmethod
-    def order_selector(cls) -> list[str]:
-        """Order selection information."""
-        return DjedShenOrderStateBase.order_selector()
-
-    @classmethod
-    def pool_selector(cls) -> PoolSelector:
-        """Pool selection information."""
-        return DjedShenOrderStateBase.pool_selector()
-
-    @classmethod
-    def oracle_selector(cls) -> PoolSelector:
-        """Oracle selection information."""
-        return DjedShenOrderStateBase.oracle_selector()
-
-    @property
-    def swap_forward(self) -> bool:
-        """Returns if swap forwarding is enabled."""
-        return True
-
-    @classmethod
-    def default_script_class(cls) -> type[PlutusV1Script] | type[PlutusV2Script]:
-        """Get default script class."""
-        return DjedShenOrderStateBase.default_script_class()
-
-    @classmethod
-    def order_datum_class(cls) -> type[PlutusData]:
-        """Returns data class used for handling order datums."""
-        return DjedShenOrderStateBase.order_datum_class()
-
-    @property
-    def stake_address(self) -> Address | None:
-        """Return the staking address."""
-        return None
+    def shen_asset(cls) -> str:
+        """Return the SHEN asset ID."""
+        return SHEN_TOKEN
 
     @classmethod
     def _get_oracle_utxo_and_datum(cls) -> tuple[UTxO, DjedOracleDatum]:
@@ -1091,7 +451,6 @@ class DjedShenOrderBookBase(AbstractOrderBookState):
             raise RuntimeError("Oracle UTxO not found")
         oracle_info = oracle_utxos[0]
         datum = DjedOracleDatum.from_cbor(oracle_info.datum_cbor)
-        # Include datum in UTxO output - required for Ogmios evaluation
         utxo = UTxO(
             input=TransactionInput(
                 TransactionId(bytes.fromhex(oracle_info.tx_hash)),
@@ -1118,7 +477,6 @@ class DjedShenOrderBookBase(AbstractOrderBookState):
             raise RuntimeError("Pool UTxO not found")
         pool_info = pool_utxos[0]
         datum = DjedPoolDatum.from_cbor(pool_info.datum_cbor)
-        # Include datum in UTxO output - required for Ogmios evaluation
         utxo = UTxO(
             input=TransactionInput(
                 TransactionId(bytes.fromhex(pool_info.tx_hash)),
@@ -1137,7 +495,6 @@ class DjedShenOrderBookBase(AbstractOrderBookState):
         """Get the order minting policy script reference UTxO."""
         from pycardano import ScriptHash
 
-        # Get script from address derived from policy ID
         script = get_backend().get_script_from_address(
             Address(
                 payment_part=ScriptHash(
@@ -1145,17 +502,254 @@ class DjedShenOrderBookBase(AbstractOrderBookState):
                 ),
             ),
         )
+
         return UTxO(
             input=TransactionInput(
-                TransactionId(bytes.fromhex(script.tx_hash)),
-                index=script.tx_index,
+                TransactionId(
+                    bytes.fromhex(
+                        "1a757d9840dfd77f5aa0223245b553d412328dadb10abc5225f4f8e53ae90ee0",
+                    ),
+                ),
+                index=1,
             ),
             output=TransactionOutput(
                 address=Address.decode(script.address),
-                amount=asset_to_value(script.assets),
+                amount=Value(coin=22_110_300),
                 script=PlutusV2Script(bytes.fromhex(script.script)),
             ),
         )
+
+    @classmethod
+    def batcher_fee(
+        cls,
+        in_assets: Assets,
+        out_assets: Assets,
+        oracle_rate: "DjedRational | None" = None,
+        pool_datum: "DjedPoolDatum | None" = None,
+        include_action_fee: bool = True,
+    ) -> Assets:
+        """Calculate total fee estimate for a mint or burn operation.
+
+        Args:
+            in_assets: Input assets (ADA for mints, tokens for burns)
+            out_assets: Output assets (DJED for mints, ADA for burns)
+            oracle_rate: Pre-fetched oracle rate (fetched if None)
+            pool_datum: Pre-fetched pool datum (fetched if None, needed for SHEN)
+            include_action_fee: If True, include action fee in the calculation
+
+        Returns:
+            Total fees in ADA (operator fee + action fee)
+        """
+        if oracle_rate is None:
+            _oracle_utxo, oracle_datum = cls._get_oracle_utxo_and_datum()
+            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+
+        if in_assets.unit() == "lovelace":
+            if out_assets.unit() == DJED_TOKEN:
+                base_ada = math.ceil(
+                    out_assets.quantity()
+                    * oracle_rate.denominator
+                    / oracle_rate.numerator,
+                )
+                ada_with_fee = math.ceil(
+                    out_assets.quantity()
+                    * oracle_rate.denominator
+                    * 1015
+                    / (oracle_rate.numerator * 1000),
+                )
+            elif out_assets.unit() == SHEN_TOKEN:
+                if pool_datum is None:
+                    _pool_utxo, pool_datum = cls._get_pool_utxo_and_datum()
+                fee_num, fee_den = ShenOrderBook.price_ratio(
+                    side="mint",
+                    oracle_rate=oracle_rate,
+                    pool_datum=pool_datum,
+                )
+                ada_with_fee = math.ceil(out_assets.quantity() * fee_num / fee_den)
+                base_ada = math.ceil(
+                    out_assets.quantity() * fee_num * 1000 / (fee_den * 1015),
+                )
+            else:
+                raise ValueError(f"Unsupported mint output asset: {out_assets.unit()}")
+
+            operator_fee = _calculate_operator_fee(ada_with_fee)
+            action_fee = max(0, ada_with_fee - base_ada)
+            if include_action_fee:
+                return Assets(lovelace=operator_fee + action_fee)
+            return Assets(lovelace=operator_fee)
+
+        if in_assets.unit() == DJED_TOKEN:
+            base_ada = (in_assets.quantity() * oracle_rate.denominator) // (
+                oracle_rate.numerator
+            )
+            ada_with_fee = (in_assets.quantity() * oracle_rate.denominator * 985) // (
+                oracle_rate.numerator * 1000
+            )
+        elif in_assets.unit() == SHEN_TOKEN:
+            if pool_datum is None:
+                _pool_utxo, pool_datum = cls._get_pool_utxo_and_datum()
+            fee_num, fee_den = ShenOrderBook.price_ratio(
+                side="burn",
+                oracle_rate=oracle_rate,
+                pool_datum=pool_datum,
+            )
+            ada_with_fee = (in_assets.quantity() * fee_num) // fee_den
+            # Recover no-fee estimate from fee-applied ratio (x * 985 / 1000).
+            base_ada = (in_assets.quantity() * fee_num * 1000) // (fee_den * 985)
+        else:
+            raise ValueError(f"Unsupported burn input asset: {in_assets.unit()}")
+
+        operator_fee = _calculate_operator_fee(ada_with_fee)
+        action_fee = max(0, base_ada - ada_with_fee)
+        if include_action_fee:
+            return Assets(lovelace=operator_fee + action_fee)
+        return Assets(lovelace=operator_fee)
+
+    @classmethod
+    def get_reserve_ratio(
+        cls,
+        oracle_rate: "DjedRational | None" = None,
+        pool_datum: "DjedPoolDatum | None" = None,
+    ) -> float:
+        """Get current reserve ratio as a percentage."""
+        if oracle_rate is None:
+            _, oracle_datum = cls._get_oracle_utxo_and_datum()
+            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        if pool_datum is None:
+            _, pool_datum = cls._get_pool_utxo_and_datum()
+
+        liabilities = pool_datum.djed_in_circulation * oracle_rate.denominator
+        if liabilities == 0:
+            return float("inf")
+
+        assets = pool_datum.ada_in_reserve * oracle_rate.numerator
+        return (assets / liabilities) * 100
+
+    @staticmethod
+    def _fraction_floor_non_negative(value: Fraction) -> int:
+        """Convert a rational to a non-negative floored integer."""
+        return max(0, value.numerator // value.denominator)
+
+    @classmethod
+    def max_mintable_djed(
+        cls,
+        oracle_rate: "DjedRational | None" = None,
+        pool_datum: "DjedPoolDatum | None" = None,
+    ) -> int:
+        """Maximum DJED mintable under min reserve ratio constraint."""
+        if oracle_rate is None:
+            _, oracle_datum = cls._get_oracle_utxo_and_datum()
+            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        if pool_datum is None:
+            _, pool_datum = cls._get_pool_utxo_and_datum()
+
+        djed_ada_rate = Fraction(oracle_rate.denominator, oracle_rate.numerator)
+        mint_fee = Fraction(FEE_NUMERATOR, FEE_DENOMINATOR)
+        min_reserve_ratio = Fraction(MIN_RESERVE_RATIO_PERCENT, 100)
+        denominator_factor = min_reserve_ratio - 1 - mint_fee
+        if denominator_factor <= 0:
+            return 0
+
+        value = (
+            Fraction(pool_datum.ada_in_reserve)
+            - min_reserve_ratio * pool_datum.djed_in_circulation * djed_ada_rate
+        ) / (djed_ada_rate * denominator_factor)
+        return cls._fraction_floor_non_negative(value)
+
+    @classmethod
+    def max_mintable_shen(
+        cls,
+        oracle_rate: "DjedRational | None" = None,
+        pool_datum: "DjedPoolDatum | None" = None,
+    ) -> int:
+        """Maximum SHEN mintable under max reserve ratio constraint."""
+        if oracle_rate is None:
+            _, oracle_datum = cls._get_oracle_utxo_and_datum()
+            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        if pool_datum is None:
+            _, pool_datum = cls._get_pool_utxo_and_datum()
+        if pool_datum.shen_in_circulation <= 0:
+            return 0
+
+        djed_ada_rate = Fraction(oracle_rate.denominator, oracle_rate.numerator)
+        shen_ada_rate = (
+            Fraction(pool_datum.ada_in_reserve)
+            - pool_datum.djed_in_circulation * djed_ada_rate
+        ) / pool_datum.shen_in_circulation
+        if shen_ada_rate <= 0:
+            return 0
+
+        mint_fee = Fraction(FEE_NUMERATOR, FEE_DENOMINATOR)
+        max_reserve_ratio = Fraction(MAX_RESERVE_RATIO_PERCENT, 100)
+        value = (
+            (
+                max_reserve_ratio * pool_datum.djed_in_circulation * djed_ada_rate
+                - Fraction(pool_datum.ada_in_reserve)
+            )
+            / shen_ada_rate
+            / (1 + mint_fee)
+        )
+
+        return max(0, cls._fraction_floor_non_negative(value) - 1)
+
+    @classmethod
+    def max_burnable_shen(
+        cls,
+        oracle_rate: "DjedRational | None" = None,
+        pool_datum: "DjedPoolDatum | None" = None,
+    ) -> int:
+        """Maximum SHEN burnable under min reserve ratio constraint."""
+        if oracle_rate is None:
+            _, oracle_datum = cls._get_oracle_utxo_and_datum()
+            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        if pool_datum is None:
+            _, pool_datum = cls._get_pool_utxo_and_datum()
+        if pool_datum.shen_in_circulation <= 0:
+            return 0
+
+        djed_ada_rate = Fraction(oracle_rate.denominator, oracle_rate.numerator)
+        shen_ada_rate = (
+            Fraction(pool_datum.ada_in_reserve)
+            - pool_datum.djed_in_circulation * djed_ada_rate
+        ) / pool_datum.shen_in_circulation
+        if shen_ada_rate <= 0:
+            return 0
+
+        burn_fee = Fraction(FEE_NUMERATOR, FEE_DENOMINATOR)
+        min_reserve_ratio = Fraction(MIN_RESERVE_RATIO_PERCENT, 100)
+        fee_factor = 1 - burn_fee
+        if fee_factor <= 0:
+            return 0
+
+        value = (
+            (
+                Fraction(pool_datum.ada_in_reserve)
+                - min_reserve_ratio * pool_datum.djed_in_circulation * djed_ada_rate
+            )
+            / shen_ada_rate
+            / fee_factor
+        )
+        return cls._fraction_floor_non_negative(value)
+
+    @property
+    def swap_forward(self) -> bool:
+        """Returns if swap forwarding is enabled."""
+        return True
+
+    @classmethod
+    def default_script_class(cls) -> type[PlutusV1Script] | type[PlutusV2Script]:
+        """Get default script class."""
+        return PlutusV2Script
+
+    @classmethod
+    def order_datum_class(cls) -> type[PlutusData]:
+        """Returns data class used for handling order datums."""
+        return DjedOrderDatum
+
+    @property
+    def stake_address(self) -> Address | None:
+        """Return the staking address."""
+        return None
 
 
 class DjedOrderBook(DjedShenOrderBookBase):
@@ -1164,55 +758,23 @@ class DjedOrderBook(DjedShenOrderBookBase):
     @classmethod
     def get_book(
         cls,
-        assets: Assets,
-        orders: list[DjedOrderState] | None = None,
+        assets: Assets | None = None,
+        orders: list[OrderBookOrder] | None = None,
     ) -> "DjedOrderBook":
-        """Create Djed order book."""
-        if orders is None:
-            selector = DjedOrderState.pool_selector()
-
-            result = get_backend().get_pool_utxos(
-                limit=1000,
-                historical=False,
-                **selector.model_dump(),
-            )
-
-            orders = [
-                DjedOrderState.model_validate(r.model_dump())
-                for r in result
-                if cls._is_djed_order(r)
-            ]
-
-        buy_orders = []  # Djed mint orders
-        sell_orders = []  # Djed burn orders
-
-        for order in orders:
-            if order.inactive:
-                continue
-
-            price = order.price[0] / order.price[1]
-            o = OrderBookOrder(
-                price=price,
-                quantity=int(order.available.quantity()),
-                state=order,
-            )
-
-            if isinstance(order.order_datum.action, DjedMintAction):
-                buy_orders.append(o)  # Mint = Buy
-            else:  # DjedBurnAction
-                sell_orders.append(o)  # Burn = Sell
+        """Create a placeholder Djed order book for transaction building."""
+        if assets is None:
+            assets = Assets({"lovelace": 0, DJED_TOKEN: 0})
+        buy_orders = orders or []
 
         ob = DjedOrderBook(
             assets=assets,
             plutus_v2=True,
             block_time=int(time.time()),
             block_index=0,
-            sell_book_full=SellOrderBook(sell_orders),
+            sell_book_full=SellOrderBook([]),
             buy_book_full=BuyOrderBook(buy_orders),
         )
 
-        # Limit orders per transaction (following GeniusYield pattern)
-        ob.sell_book_full = ob.sell_book_full[:3]
         ob.buy_book_full = ob.buy_book_full[:3]
 
         return ob
@@ -1228,83 +790,182 @@ class DjedOrderBook(DjedShenOrderBookBase):
         return "Djed"
 
     @classmethod
-    def _is_djed_order(cls, order_data: AbstractOrderState) -> bool:
-        """Check if order is a Djed order (not Shen)."""
-        try:
-            # Parse datum to check action type
-            datum = DjedOrderDatum.from_cbor(order_data.datum_cbor)
-            return isinstance(datum.action, (DjedMintAction, DjedBurnAction))
-        except (ValueError, AttributeError):
-            return False
+    def price_ratio(
+        cls,
+        side: str = "mint",
+        oracle_rate: "DjedRational | None" = None,
+    ) -> tuple[int, int]:
+        """Return ADA/DJED price as (numerator, denominator)."""
+        if oracle_rate is None:
+            _, oracle_datum = cls._get_oracle_utxo_and_datum()
+            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+
+        num = oracle_rate.denominator
+        den = oracle_rate.numerator
+        if side == "mint":  # Add 1.5% fee
+            num *= 1015
+            den *= 1000
+        elif side == "burn":  # Deduct 1.5% fee
+            num *= 985
+            den *= 1000
+        else:
+            raise ValueError("side must be 'mint' or 'burn'")
+        return num, den
+
+    @property
+    def price(self) -> tuple[int, int]:
+        """Price for ADA/DJED (includes 1.5% action fee)."""
+        return self.price_ratio(side="mint")
 
     @classmethod
-    def buy(
+    def get_amount_out(
         cls,
-        amount: int,
-        user_address: Address,
-        tx_builder: TransactionBuilder,
-    ) -> tuple[TransactionOutput, DjedOrderDatum]:
-        """Create a Djed mint order (buy DJED with ADA).
-
-        Based on open-djed create-mint-djed-order.ts pattern.
+        asset: Assets,
+    ) -> tuple[Assets, float]:
+        """Calculate output for a given input for Djed mint/burn operations.
 
         Args:
-            amount: Amount of DJED to mint (in lovelace-equivalent units)
-            user_address: User's address to receive DJED
-            tx_builder: TransactionBuilder to add the order to
+            asset: Input assets (ADA for mint, DJED for burn)
+
+        Returns:
+            Tuple of (output_assets, slippage). Includes 1.5% action fee.
+        """
+        _, oracle_datum = cls._get_oracle_utxo_and_datum()
+        oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        if asset.unit() == "lovelace":
+            num, den = cls.price_ratio(
+                side="mint",
+                oracle_rate=oracle_rate,
+            )
+            djed_out = (asset.quantity() * den) // num
+            return Assets(**{DJED_TOKEN: djed_out}), 0
+        num, den = cls.price_ratio(
+            side="burn",
+            oracle_rate=oracle_rate,
+        )
+        ada_out = (asset.quantity() * num) // den
+        return Assets(lovelace=ada_out), 0
+
+    @classmethod
+    def get_amount_in(
+        cls,
+        asset: Assets,
+    ) -> tuple[Assets, float]:
+        """Calculate required input for a desired output for Djed mint/burn operations.
+
+        Args:
+            asset: Desired output assets (DJED for mint, ADA for burn)
+
+        Returns:
+            Tuple of (input_assets, slippage). Includes 1.5% action fee.
+        """
+        _, oracle_datum = cls._get_oracle_utxo_and_datum()
+        oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        if asset.unit() == "lovelace":
+            num, den = cls.price_ratio(
+                side="burn",
+                oracle_rate=oracle_rate,
+            )
+            djed_in = math.ceil(asset.quantity() * den / num)
+            return Assets(**{DJED_TOKEN: djed_in}), 0
+        num, den = cls.price_ratio(
+            side="mint",
+            oracle_rate=oracle_rate,
+        )
+        ada_in = math.ceil(asset.quantity() * num / den)
+        return Assets(lovelace=ada_in), 0
+
+    def swap_utxo(
+        self,
+        address_source: Address,
+        in_assets: Assets,
+        out_assets: Assets,
+        tx_builder: TransactionBuilder,
+        extra_assets: Assets | None = None,
+        address_target: Address | None = None,
+        datum_target: PlutusData | None = None,
+    ) -> tuple[TransactionOutput | None, PlutusData]:
+        """Create a Djed mint/burn order.
 
         Returns:
             Tuple of (TransactionOutput to order contract, OrderDatum)
         """
-        # Get current slot FIRST (for consistency with oracle validity range)
-        now_slot = tx_builder.context.last_block_slot
-        ttl_slot = now_slot + 180  # 3 minutes
+        target_address = address_target or address_source
+        if in_assets.unit() == "lovelace":
+            amount = out_assets.quantity()
+            is_mint = True
+            if out_assets.quantity() < MIN_ORDER_AMOUNT:
+                raise ValueError(
+                    f"Minimum mint amount for DJED is {MIN_ORDER_AMOUNT}",
+                )
+        elif in_assets.unit() == DJED_TOKEN:
+            amount = in_assets.quantity()
+            is_mint = False
+            if in_assets.quantity() < MIN_ORDER_AMOUNT:
+                raise ValueError(
+                    f"Minimum burn amount for DJED is {MIN_ORDER_AMOUNT}",
+                )
+        else:
+            raise ValueError(f"Unsupported input asset for Djed: {in_assets.unit()}")
 
-        # Set validity interval immediately
+        now_slot = tx_builder.context.last_block_slot
+        ttl_slot = now_slot + 180
         tx_builder.validity_start = now_slot
         tx_builder.ttl = ttl_slot
-
-        # Convert TTL slot to POSIX ms for datum
         creation_time = _slot_to_posix_ms(ttl_slot)
 
-        # Fetch UTxOs (oracle validity range should contain our validity interval)
-        oracle_utxo, oracle_datum = cls._get_oracle_utxo_and_datum()
-        pool_utxo, pool_datum = cls._get_pool_utxo_and_datum()
-        minting_policy_ref = cls._get_minting_policy_ref_utxo()
+        oracle_utxo, oracle_datum = self._get_oracle_utxo_and_datum()
+        pool_utxo, pool_datum = self._get_pool_utxo_and_datum()
+        minting_policy_ref = self._get_minting_policy_ref_utxo()
 
         oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        reserve_ratio = self.get_reserve_ratio(oracle_rate, pool_datum)
 
-        # Calculate ADA needed: ceil(amount * (denom/num) * 1.015)
-        numerator = amount * oracle_rate.denominator * 1015
-        denominator = oracle_rate.numerator * 1000
-        ada_amount = math.ceil(numerator / denominator)
+        if is_mint:
+            if reserve_ratio <= MIN_RESERVE_RATIO_PERCENT:
+                raise ValueError(
+                    "DJED mint not allowed: reserve ratio "
+                    f"{reserve_ratio:.2f}% must be > "
+                    f"{MIN_RESERVE_RATIO_PERCENT}%",
+                )
+            num, den = self.price_ratio(
+                side="mint",
+                oracle_rate=oracle_rate,
+            )
+            ada_amount = math.ceil(amount * num / den)
+            operator_fee = _calculate_operator_fee(ada_amount)
+            total_ada = ada_amount + pool_datum.min_ada + operator_fee
+            order_datum = DjedOrderDatum(
+                action=DjedMintAction(djed_amount=amount, ada_amount=ada_amount),
+                owner_address=PlutusFullAddress.from_address(target_address),
+                oracle_rate=oracle_rate,
+                creation_time=creation_time,
+                order_nft=bytes.fromhex(ORDER_NFT_POLICY),
+            )
+            output_assets = Assets(lovelace=total_ada)
+        else:
+            num, den = self.price_ratio(
+                side="burn",
+                oracle_rate=oracle_rate,
+            )
+            ada_amount = (amount * num) // den
+            operator_fee = _calculate_operator_fee(ada_amount)
+            total_ada = pool_datum.min_ada + operator_fee
+            order_datum = DjedOrderDatum(
+                action=DjedBurnAction(djed_amount=amount),
+                owner_address=PlutusFullAddress.from_address(target_address),
+                oracle_rate=oracle_rate,
+                creation_time=creation_time,
+                order_nft=bytes.fromhex(ORDER_NFT_POLICY),
+            )
+            output_assets = Assets(**{DJED_TOKEN: amount, "lovelace": total_ada})
 
-        operator_fee = max(5_150_000, min(25_000_000, ada_amount * 1 // 400))
-
-        # Total ADA to send
-        total_ada = ada_amount + pool_datum.min_ada + operator_fee
-
-        # Create order datum
-        order_datum = DjedOrderDatum(
-            action=DjedMintAction(djed_amount=amount, ada_amount=ada_amount),
-            owner_address=PlutusFullAddress.from_address(user_address),
-            oracle_rate=oracle_rate,
-            creation_time=creation_time,
-            order_nft=bytes.fromhex(ORDER_NFT_POLICY),
-        )
-
-        # Add reference inputs (oracle, pool, minting policy)
         tx_builder.reference_inputs.add(oracle_utxo)
         tx_builder.reference_inputs.add(pool_utxo)
         tx_builder.reference_inputs.add(minting_policy_ref)
 
-        # Order NFT unit (policy + name)
-        order_nft_unit = ORDER_NFT_POLICY + "446a65644f726465725469636b6574"
-
-        # Create output to order contract (includes order NFT)
-        order_address = Address.decode(cls.order_selector()[0])
-        output_assets = Assets(lovelace=total_ada)
-        output_assets.root[order_nft_unit] = 1
+        order_address = Address.decode(self.order_selector()[0])
+        output_assets.root[ORDER_NFT_POLICY + ORDER_NFT_NAME_HEX] = 1
         order_output = TransactionOutput(
             address=order_address,
             amount=asset_to_value(output_assets),
@@ -1314,88 +975,9 @@ class DjedOrderBook(DjedShenOrderBookBase):
         tx_builder.add_output(order_output)
         _finalize_order_tx(
             tx_builder,
-            user_address,
+            target_address,
             pool_datum,
             minting_policy_ref,
-            order_nft_unit,
-        )
-
-        return order_output, order_datum
-
-    @classmethod
-    def sell(
-        cls,
-        amount: int,
-        user_address: Address,
-        tx_builder: TransactionBuilder,
-    ) -> tuple[TransactionOutput, DjedOrderDatum]:
-        """Create a Djed burn order (sell DJED for ADA).
-
-        Based on open-djed create-burn-djed-order.ts pattern.
-
-        Args:
-            amount: Amount of DJED to burn (in lovelace-equivalent units)
-            user_address: User's address to receive ADA
-            tx_builder: TransactionBuilder to add the order to
-
-        Returns:
-            Tuple of (TransactionOutput to order contract, OrderDatum)
-        """
-        # Get current slot FIRST (for consistency with oracle validity range)
-        now_slot = tx_builder.context.last_block_slot
-        ttl_slot = now_slot + 180  # 3 minutes
-
-        # Set validity interval immediately
-        tx_builder.validity_start = now_slot
-        tx_builder.ttl = ttl_slot
-
-        # Convert TTL slot to POSIX ms for datum
-        creation_time = _slot_to_posix_ms(ttl_slot)
-
-        # Fetch UTxOs (oracle validity range should contain our validity interval)
-        oracle_utxo, oracle_datum = cls._get_oracle_utxo_and_datum()
-        pool_utxo, pool_datum = cls._get_pool_utxo_and_datum()
-        minting_policy_ref = cls._get_minting_policy_ref_utxo()
-
-        oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
-
-        # Create order datum
-        order_datum = DjedOrderDatum(
-            action=DjedBurnAction(djed_amount=amount),
-            owner_address=PlutusFullAddress.from_address(user_address),
-            oracle_rate=oracle_rate,
-            creation_time=creation_time,
-            order_nft=bytes.fromhex(ORDER_NFT_POLICY),
-        )
-
-        # Add reference inputs (oracle, pool, minting policy)
-        tx_builder.reference_inputs.add(oracle_utxo)
-        tx_builder.reference_inputs.add(pool_utxo)
-        tx_builder.reference_inputs.add(minting_policy_ref)
-
-        # Order NFT unit (policy + name)
-        order_nft_unit = ORDER_NFT_POLICY + "446a65644f726465725469636b6574"
-
-        # For burn orders, user sends DJED tokens + order NFT
-        output_assets = Assets(**{DJED_TOKEN: amount})
-        output_assets += Assets(lovelace=pool_datum.min_ada)
-        output_assets.root[order_nft_unit] = 1
-
-        # Create output to order contract
-        order_address = Address.decode(cls.order_selector()[0])
-        order_output = TransactionOutput(
-            address=order_address,
-            amount=asset_to_value(output_assets),
-            datum=order_datum,
-        )
-
-        tx_builder.add_output(order_output)
-        _finalize_order_tx(
-            tx_builder,
-            user_address,
-            pool_datum,
-            minting_policy_ref,
-            order_nft_unit,
         )
 
         return order_output, order_datum
@@ -1407,55 +989,23 @@ class ShenOrderBook(DjedShenOrderBookBase):
     @classmethod
     def get_book(
         cls,
-        assets: Assets,
-        orders: list[ShenOrderState] | None = None,
+        assets: Assets | None = None,
+        orders: list[OrderBookOrder] | None = None,
     ) -> "ShenOrderBook":
-        """Create Shen order book."""
-        if orders is None:
-            selector = ShenOrderState.pool_selector()
-
-            result = get_backend().get_pool_utxos(
-                limit=1000,
-                historical=False,
-                **selector.model_dump(),
-            )
-
-            orders = [
-                ShenOrderState.model_validate(r.model_dump())
-                for r in result
-                if cls._is_shen_order(r)
-            ]
-
-        buy_orders = []  # Shen mint orders
-        sell_orders = []  # Shen burn orders
-
-        for order in orders:
-            if order.inactive:
-                continue
-
-            price = order.price[0] / order.price[1]
-            o = OrderBookOrder(
-                price=price,
-                quantity=int(order.available.quantity()),
-                state=order,
-            )
-
-            if isinstance(order.order_datum.action, ShenMintAction):
-                buy_orders.append(o)  # Mint = Buy
-            else:  # ShenBurnAction
-                sell_orders.append(o)  # Burn = Sell
+        """Create a placeholder Shen order book for transaction building."""
+        if assets is None:
+            assets = Assets({"lovelace": 0, SHEN_TOKEN: 0})
+        buy_orders = orders or []
 
         ob = ShenOrderBook(
             assets=assets,
             plutus_v2=True,
             block_time=int(time.time()),
             block_index=0,
-            sell_book_full=SellOrderBook(sell_orders),
+            sell_book_full=SellOrderBook([]),
             buy_book_full=BuyOrderBook(buy_orders),
         )
 
-        # Limit orders per transaction (following GeniusYield pattern)
-        ob.sell_book_full = ob.sell_book_full[:3]
         ob.buy_book_full = ob.buy_book_full[:3]
 
         return ob
@@ -1471,169 +1021,211 @@ class ShenOrderBook(DjedShenOrderBookBase):
         return "Shen"
 
     @classmethod
-    def _is_shen_order(cls, order_data: AbstractOrderState) -> bool:
-        """Check if order is a Shen order (not Djed)."""
-        try:
-            # Parse datum to check action type
-            datum = DjedOrderDatum.from_cbor(order_data.datum_cbor)
-            return isinstance(datum.action, (ShenMintAction, ShenBurnAction))
-        except (ValueError, AttributeError):
-            return False
+    def price_ratio(
+        cls,
+        side: str = "mint",
+        oracle_rate: "DjedRational | None" = None,
+        pool_datum: "DjedPoolDatum | None" = None,
+    ) -> tuple[int, int]:
+        """Return ADA/SHEN price as (numerator, denominator)."""
+        if oracle_rate is None:
+            _, oracle_datum = cls._get_oracle_utxo_and_datum()
+            oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        if pool_datum is None:
+            _, pool_datum = cls._get_pool_utxo_and_datum()
+
+        num = (
+            pool_datum.ada_in_reserve * oracle_rate.numerator
+            - pool_datum.djed_in_circulation * oracle_rate.denominator
+        )
+        den = pool_datum.shen_in_circulation * oracle_rate.numerator
+
+        if side == "mint":  # Add 1.5% fee
+            num *= 1015
+            den *= 1000
+        elif side == "burn":  # Deduct 1.5% fee
+            num *= 985
+            den *= 1000
+        else:
+            raise ValueError("side must be 'mint' or 'burn'")
+
+        return num, den
+
+    @property
+    def price(self) -> tuple[int, int]:
+        """Price for ADA/SHEN (includes 1.5% action fee)."""
+        return self.price_ratio(side="mint")
 
     @classmethod
-    def buy(
+    def get_amount_out(
         cls,
-        amount: int,
-        user_address: Address,
-        tx_builder: TransactionBuilder,
-    ) -> tuple[TransactionOutput, DjedOrderDatum]:
-        """Create a Shen mint order (buy SHEN with ADA).
-
-        Based on open-djed create-mint-shen-order.ts pattern.
-        Shen price is based on excess reserves beyond DJED backing.
+        asset: Assets,
+    ) -> tuple[Assets, float]:
+        """Calculate output for a given input for Shen mint/burn operations.
 
         Args:
-            amount: Amount of SHEN to mint (in lovelace-equivalent units)
-            user_address: User's address to receive SHEN
-            tx_builder: TransactionBuilder to add the order to
+            asset: Input assets (ADA for mint, SHEN for burn)
 
         Returns:
-            Tuple of (TransactionOutput to order contract, OrderDatum)
+            Tuple of (output_assets, slippage). Includes 1.5% action fee.
         """
-        now_slot = tx_builder.context.last_block_slot
-        ttl_slot = now_slot + 180  # 3 minutes
-
-        # Set validity interval immediately
-        tx_builder.validity_start = now_slot
-        tx_builder.ttl = ttl_slot
-
-        # Convert TTL slot to POSIX ms for datum
-        creation_time = _slot_to_posix_ms(ttl_slot)
-
-        oracle_utxo, oracle_datum = cls._get_oracle_utxo_and_datum()
-        pool_utxo, pool_datum = cls._get_pool_utxo_and_datum()
-        minting_policy_ref = cls._get_minting_policy_ref_utxo()
-
+        _, oracle_datum = cls._get_oracle_utxo_and_datum()
         oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
-
-        # Calculate ADA needed using rational arithmetic (avoids precision loss).
-        # Formula uses ceiling division to match open-djed TypeScript behavior.
-        numerator = (
-            amount
-            * (
-                pool_datum.ada_in_reserve * oracle_rate.numerator
-                - pool_datum.djed_in_circulation * oracle_rate.denominator
+        _, pool_datum = cls._get_pool_utxo_and_datum()
+        num, den = cls.price_ratio(
+            side="mint" if asset.unit() == "lovelace" else "burn",
+            oracle_rate=oracle_rate,
+            pool_datum=pool_datum,
+        )
+        if num <= 0 or den <= 0:
+            return (
+                Assets(**{SHEN_TOKEN: 0})
+                if asset.unit() == "lovelace"
+                else Assets(lovelace=0),
+                0,
             )
-            * 1015
-        )
-        denominator = oracle_rate.numerator * pool_datum.shen_in_circulation * 1000
-        ada_amount = math.ceil(numerator / denominator)
-
-        # Calculate operator fee
-        operator_fee = max(5_150_000, min(25_000_000, ada_amount * 1 // 400))
-
-        # Total ADA to send
-        total_ada = ada_amount + pool_datum.min_ada + operator_fee
-
-        # Create order datum
-        order_datum = DjedOrderDatum(
-            action=ShenMintAction(shen_amount=amount, ada_amount=ada_amount),
-            owner_address=PlutusFullAddress.from_address(user_address),
-            oracle_rate=oracle_rate,
-            creation_time=creation_time,
-            order_nft=bytes.fromhex(ORDER_NFT_POLICY),
-        )
-
-        # Add reference inputs (oracle, pool, minting policy)
-        tx_builder.reference_inputs.add(oracle_utxo)
-        tx_builder.reference_inputs.add(pool_utxo)
-        tx_builder.reference_inputs.add(minting_policy_ref)
-
-        # Order NFT unit (policy + name)
-        order_nft_unit = ORDER_NFT_POLICY + "446a65644f726465725469636b6574"
-
-        # Create output to order contract (includes order NFT)
-        order_address = Address.decode(cls.order_selector()[0])
-        output_assets = Assets(lovelace=total_ada)
-        output_assets.root[order_nft_unit] = 1
-        order_output = TransactionOutput(
-            address=order_address,
-            amount=asset_to_value(output_assets),
-            datum=order_datum,
-        )
-
-        tx_builder.add_output(order_output)
-        _finalize_order_tx(
-            tx_builder,
-            user_address,
-            pool_datum,
-            minting_policy_ref,
-            order_nft_unit,
-        )
-
-        return order_output, order_datum
+        if asset.unit() == "lovelace":
+            shen_out = (asset.quantity() * den) // num
+            return Assets(**{SHEN_TOKEN: shen_out}), 0
+        ada_out = (asset.quantity() * num) // den
+        return Assets(lovelace=ada_out), 0.0
 
     @classmethod
-    def sell(
+    def get_amount_in(
         cls,
-        amount: int,
-        user_address: Address,
-        tx_builder: TransactionBuilder,
-    ) -> tuple[TransactionOutput, DjedOrderDatum]:
-        """Create a Shen burn order (sell SHEN for ADA).
-
-        Based on open-djed create-burn-shen-order.ts pattern.
+        asset: Assets,
+    ) -> tuple[Assets, float]:
+        """Calculate required input for a desired output for Shen mint/burn operations.
 
         Args:
-            amount: Amount of SHEN to burn (in lovelace-equivalent units)
-            user_address: User's address to receive ADA
-            tx_builder: TransactionBuilder to add the order to
+            asset: Desired output assets (SHEN for mint, ADA for burn)
+
+        Returns:
+            Tuple of (input_assets, slippage). Includes 1.5% action fee.
+        """
+        _, oracle_datum = cls._get_oracle_utxo_and_datum()
+        oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        _, pool_datum = cls._get_pool_utxo_and_datum()
+        if asset.unit() == "lovelace":
+            num, den = cls.price_ratio(
+                side="burn",
+                oracle_rate=oracle_rate,
+                pool_datum=pool_datum,
+            )
+            if num <= 0 or den <= 0:
+                return Assets(**{SHEN_TOKEN: 0}), 0
+            shen_in = math.ceil(asset.quantity() * den / num)
+            return Assets(**{SHEN_TOKEN: shen_in}), 0
+        num, den = cls.price_ratio(
+            side="mint",
+            oracle_rate=oracle_rate,
+            pool_datum=pool_datum,
+        )
+        if num <= 0 or den <= 0:
+            return Assets(lovelace=0), 0
+        ada_in = math.ceil(asset.quantity() * num / den)
+        return Assets(lovelace=ada_in), 0
+
+    def swap_utxo(
+        self,
+        address_source: Address,
+        in_assets: Assets,
+        out_assets: Assets,
+        tx_builder: TransactionBuilder,
+        extra_assets: Assets | None = None,
+        address_target: Address | None = None,
+        datum_target: PlutusData | None = None,
+    ) -> tuple[TransactionOutput | None, PlutusData]:
+        """Create a Shen mint/burn order.
 
         Returns:
             Tuple of (TransactionOutput to order contract, OrderDatum)
         """
-        # Get current slot FIRST (for consistency with oracle validity range)
-        now_slot = tx_builder.context.last_block_slot
-        ttl_slot = now_slot + 180  # 3 minutes
+        target_address = address_target or address_source
+        if in_assets.unit() == "lovelace":
+            amount = out_assets.quantity()
+            is_mint = True
+            if out_assets.quantity() < MIN_ORDER_AMOUNT:
+                raise ValueError(
+                    f"Minimum mint amount for SHEN is {MIN_ORDER_AMOUNT}",
+                )
+        elif in_assets.unit() == SHEN_TOKEN:
+            amount = in_assets.quantity()
+            is_mint = False
+            if in_assets.quantity() < MIN_ORDER_AMOUNT:
+                raise ValueError(
+                    f"Minimum burn amount for SHEN is {MIN_ORDER_AMOUNT}",
+                )
+        else:
+            raise ValueError(f"Unsupported input asset for Shen: {in_assets.unit()}")
 
-        # Set validity interval immediately
+        now_slot = tx_builder.context.last_block_slot
+        ttl_slot = now_slot + 180
         tx_builder.validity_start = now_slot
         tx_builder.ttl = ttl_slot
-
-        # Convert TTL slot to POSIX ms for datum
         creation_time = _slot_to_posix_ms(ttl_slot)
 
-        # Fetch UTxOs (oracle validity range should contain our validity interval)
-        oracle_utxo, oracle_datum = cls._get_oracle_utxo_and_datum()
-        pool_utxo, pool_datum = cls._get_pool_utxo_and_datum()
-        minting_policy_ref = cls._get_minting_policy_ref_utxo()
+        oracle_utxo, oracle_datum = self._get_oracle_utxo_and_datum()
+        pool_utxo, pool_datum = self._get_pool_utxo_and_datum()
+        minting_policy_ref = self._get_minting_policy_ref_utxo()
 
         oracle_rate = oracle_datum.oracle_fields.ada_usd_exchange_rate
+        reserve_ratio = self.get_reserve_ratio(oracle_rate, pool_datum)
 
-        # Create order datum
-        order_datum = DjedOrderDatum(
-            action=ShenBurnAction(shen_amount=amount),
-            owner_address=PlutusFullAddress.from_address(user_address),
-            oracle_rate=oracle_rate,
-            creation_time=creation_time,
-            order_nft=bytes.fromhex(ORDER_NFT_POLICY),
-        )
+        if is_mint:
+            if reserve_ratio >= MAX_RESERVE_RATIO_PERCENT:
+                raise ValueError(
+                    "SHEN mint not allowed: reserve ratio "
+                    f"{reserve_ratio:.2f}% must be < "
+                    f"{MAX_RESERVE_RATIO_PERCENT}%",
+                )
+            num, den = self.price_ratio(
+                side="mint",
+                oracle_rate=oracle_rate,
+                pool_datum=pool_datum,
+            )
+            ada_amount = math.ceil(amount * num / den)
+            operator_fee = _calculate_operator_fee(ada_amount)
+            total_ada = ada_amount + pool_datum.min_ada + operator_fee
+            order_datum = DjedOrderDatum(
+                action=ShenMintAction(shen_amount=amount, ada_amount=ada_amount),
+                owner_address=PlutusFullAddress.from_address(target_address),
+                oracle_rate=oracle_rate,
+                creation_time=creation_time,
+                order_nft=bytes.fromhex(ORDER_NFT_POLICY),
+            )
+            output_assets = Assets(lovelace=total_ada)
+        else:
+            if reserve_ratio <= MIN_RESERVE_RATIO_PERCENT:
+                raise ValueError(
+                    "SHEN burn not allowed: reserve ratio "
+                    f"{reserve_ratio:.2f}% must be > "
+                    f"{MIN_RESERVE_RATIO_PERCENT}%",
+                )
+            num, den = self.price_ratio(
+                side="burn",
+                oracle_rate=oracle_rate,
+                pool_datum=pool_datum,
+            )
 
-        # Add reference inputs (oracle, pool, minting policy)
+            ada_amount = math.ceil(amount * num / den)
+            operator_fee = _calculate_operator_fee(ada_amount)
+            total_ada = pool_datum.min_ada + operator_fee
+            order_datum = DjedOrderDatum(
+                action=ShenBurnAction(shen_amount=amount),
+                owner_address=PlutusFullAddress.from_address(target_address),
+                oracle_rate=oracle_rate,
+                creation_time=creation_time,
+                order_nft=bytes.fromhex(ORDER_NFT_POLICY),
+            )
+            output_assets = Assets(**{SHEN_TOKEN: amount, "lovelace": total_ada})
+
         tx_builder.reference_inputs.add(oracle_utxo)
         tx_builder.reference_inputs.add(pool_utxo)
         tx_builder.reference_inputs.add(minting_policy_ref)
 
-        # Order NFT unit (policy + name)
-        order_nft_unit = ORDER_NFT_POLICY + "446a65644f726465725469636b6574"
-
-        # For burn orders, user sends SHEN tokens + order NFT
-        output_assets = Assets(**{SHEN_TOKEN: amount})
-        output_assets += Assets(lovelace=pool_datum.min_ada)
-        output_assets.root[order_nft_unit] = 1
-
-        # Create output to order contract
-        order_address = Address.decode(cls.order_selector()[0])
+        order_address = Address.decode(self.order_selector()[0])
+        output_assets.root[ORDER_NFT_POLICY + ORDER_NFT_NAME_HEX] = 1
         order_output = TransactionOutput(
             address=order_address,
             amount=asset_to_value(output_assets),
@@ -1643,10 +1235,9 @@ class ShenOrderBook(DjedShenOrderBookBase):
         tx_builder.add_output(order_output)
         _finalize_order_tx(
             tx_builder,
-            user_address,
+            target_address,
             pool_datum,
             minting_policy_ref,
-            order_nft_unit,
         )
 
         return order_output, order_datum
