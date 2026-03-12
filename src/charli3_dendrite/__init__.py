@@ -23,6 +23,8 @@ from charli3_dendrite.dexs.amm.wingriders import WingRidersCPPState
 from charli3_dendrite.dexs.amm.wingriders import WingRidersSSPState
 from charli3_dendrite.dexs.amm.wingriders import WingRidersV2CPPState
 from charli3_dendrite.dexs.amm.wingriders import WingRidersV2SSPState
+from charli3_dendrite.dexs.ob.chadswap import ChadSwapOrderBook
+from charli3_dendrite.dexs.ob.chadswap import ChadSwapOrderState
 from charli3_dendrite.dexs.ob.djed import DjedOrderBook
 from charli3_dendrite.dexs.ob.djed import ShenOrderBook
 from charli3_dendrite.dexs.ob.geniusyield import GeniusYieldOrderBook
