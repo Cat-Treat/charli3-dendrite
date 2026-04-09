@@ -1,10 +1,8 @@
 ﻿"""SaturnSwap Order Book Module.
 
-This is an initial, semi-functional scaffold based on ob_base.py and patterns
-from chadswap.py and geniusyield.py. On-chain details are placeholders.
+This module handles the limit order path for SaturnSwap.
 """
 
-import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -12,29 +10,24 @@ from typing import Any
 from typing import Union
 
 from pycardano import Address
-from pycardano import DeserializeException
 from pycardano import PlutusData
 from pycardano import PlutusV2Script
 from pycardano import Redeemer
-from pycardano import ScriptHash
 from pycardano import TransactionBuilder
 from pycardano import TransactionId
 from pycardano import TransactionInput
 from pycardano import TransactionOutput
 from pycardano import UTxO
-from pycardano import VerificationKeyHash
 from pycardano.utils import min_lovelace
-from pydantic import ValidationError
 
 from charli3_dendrite.backend import get_backend
 from charli3_dendrite.dataclasses.datums import OrderDatum
 from charli3_dendrite.dataclasses.datums import PlutusFullAddress
 from charli3_dendrite.dataclasses.datums import PlutusNone
-from charli3_dendrite.dataclasses.datums import PlutusPartAddress
-from charli3_dendrite.dataclasses.datums import PlutusScriptPartAddress
 from charli3_dendrite.dataclasses.models import Assets
 from charli3_dendrite.dataclasses.models import OrderType
 from charli3_dendrite.dataclasses.models import PoolSelector
+from charli3_dendrite.dexs.core.errors import NotAPoolError
 from charli3_dendrite.dexs.ob.ob_base import AbstractOrderBookState
 from charli3_dendrite.dexs.ob.ob_base import AbstractOrderState
 from charli3_dendrite.dexs.ob.ob_base import BuyOrderBook
@@ -42,23 +35,7 @@ from charli3_dendrite.dexs.ob.ob_base import OrderBookOrder
 from charli3_dendrite.dexs.ob.ob_base import SellOrderBook
 from charli3_dendrite.utility import asset_to_value
 
-logger = logging.getLogger(__name__)
-
-# Testing Constants
 SATURNSWAP_TAKER_FEE_BPS = 400
-# Basis points denominator.
-SATURNSWAP_BPS_DENOMINATOR = 10_000
-# unknown fee address - testing with swap contract address
-SATURNSWAP_FEE_ADDRESS = (
-    "addr1zyd0sj57d9lpu7cy9g9qdurpazqc9l4eaxk6j59nd2gkh4"
-    "275jq4yvpskgayj55xegdp30g5rfynax66r8vgn9fldndsqzf5tn"
-)
-SATURNSWAP_ORDER_ADDRESSES = [
-    (
-        "addr1zyd0sj57d9lpu7cy9g9qdurpazqc9l4eaxk6j59nd2gkh4"
-        "275jq4yvpskgayj55xegdp30g5rfynax66r8vgn9fldndsqzf5tn"
-    ),
-]
 
 
 @dataclass
@@ -163,6 +140,52 @@ class SaturnSwapSwapAction(PlutusData):
     input_index: int
     output_index: int
 
+    def set_idx(
+        self,
+        tx_builder: TransactionBuilder,
+    ) -> None:
+        """Set the input/output indices from the built transaction.
+
+        It is necessary to make sure that redeemer indices are already set before
+        calling this function.
+        """
+        owner_address = None
+        input_utxo = None
+
+        for key, value in tx_builder.redeemers().items():
+            if value.data == self:
+                self.input_index = key.index
+                input_utxo = tx_builder.inputs[self.input_index]
+                break
+        else:
+            raise RuntimeError("Swap input UTxO not found")
+
+        for i, tx_in in enumerate(tx_builder.inputs):
+            if (
+                tx_in.input.transaction_id == input_utxo.input.transaction_id
+                and tx_in.input.index == input_utxo.input.index
+            ):
+                self.input_index = i
+                break
+
+        swap_datum = tx_builder.datums[input_utxo.output.datum_hash]
+        owner_address = swap_datum.owner.to_address()
+
+        input_tx_id = input_utxo.input.transaction_id
+        input_index = input_utxo.input.index
+
+        for i, txo in enumerate(tx_builder.outputs):
+            if not isinstance(txo.datum, SaturnSwapPaymentDatum):
+                continue
+            output_ref = txo.datum.output_reference
+            if (
+                output_ref.tx_id.value == bytes.fromhex(str(input_tx_id))
+                and output_ref.index == input_index
+                and txo.address == owner_address
+            ):
+                self.output_index = i
+                return
+
 
 @dataclass
 class SaturnSwapCancelAction(PlutusData):
@@ -170,6 +193,17 @@ class SaturnSwapCancelAction(PlutusData):
 
     CONSTR_ID = 1
     input_index: int
+
+    def set_idx(self, tx_builder: TransactionBuilder) -> None:
+        """Set the input index from the built transaction.
+
+        It is necessary to make sure that redeemer indices are already set before
+        calling this function.
+        """
+        for key, value in tx_builder.redeemers().items():
+            if value.data == self:
+                self.input_index = key.index
+                return
 
 
 class SaturnSwapOrderState(AbstractOrderState):
@@ -197,7 +231,12 @@ class SaturnSwapOrderState(AbstractOrderState):
     @classmethod
     def order_selector(cls) -> list[str]:
         """Return order script addresses."""
-        return SATURNSWAP_ORDER_ADDRESSES
+        return [
+            (
+                "addr1zyd0sj57d9lpu7cy9g9qdurpazqc9l4eaxk6j59nd2gkh4"
+                "275jq4yvpskgayj55xegdp30g5rfynax66r8vgn9fldndsqzf5tn"
+            ),
+        ]
 
     @classmethod
     def pool_selector(cls) -> PoolSelector:
@@ -231,23 +270,17 @@ class SaturnSwapOrderState(AbstractOrderState):
         """Estimate output assets for a given input."""
         if len(asset) != 1:
             raise ValueError("Input asset must contain exactly one unit.")
-        if asset.unit() not in [self.in_unit, self.out_unit]:
-            raise ValueError("Input asset unit does not match order units.")
+        if asset.unit() != self.in_unit:
+            raise ValueError("Input asset unit must match in_unit.")
 
         num, denom = self.price
         fee_bps = self.volume_fee
 
         in_qty = int(asset.quantity())
-        if asset.unit() == self.in_unit:
-            out_qty = (in_qty * denom + num - 1) // num
-            fee = (out_qty * fee_bps) // SATURNSWAP_BPS_DENOMINATOR
-            out_qty = min(out_qty - fee, int(self.order_datum.amount_sell))
-            return Assets(**{self.out_unit: int(out_qty)}), 0
-
-        out_qty = (in_qty * num + denom - 1) // denom
-        fee = (out_qty * fee_bps) // SATURNSWAP_BPS_DENOMINATOR
-        out_qty = min(out_qty - fee, int(self.order_datum.amount_buy))
-        return Assets(**{self.in_unit: int(out_qty)}), 0
+        out_qty = (in_qty * denom + num - 1) // num
+        fee = (out_qty * fee_bps) // 10_000
+        out_qty = min(out_qty - fee, int(self.order_datum.amount_sell))
+        return Assets(**{self.out_unit: int(out_qty)}), 0
 
     def get_amount_in(
         self,
@@ -257,33 +290,19 @@ class SaturnSwapOrderState(AbstractOrderState):
         """Estimate input assets for a desired output."""
         if len(asset) != 1:
             raise ValueError("Output asset must contain exactly one unit.")
-        if asset.unit() not in [self.in_unit, self.out_unit]:
-            raise ValueError("Output asset unit does not match order units.")
+        if asset.unit() != self.out_unit:
+            raise ValueError("Output asset unit must match out_unit.")
 
         num, denom = self.price
         fee_bps = self.volume_fee
-        if fee_bps >= SATURNSWAP_BPS_DENOMINATOR:
-            return Assets(**{self.in_unit: 0}), 0
 
         desired_out = int(asset.quantity())
-        if asset.unit() == self.out_unit:
-            desired_out = min(desired_out, int(self.order_datum.amount_sell))
-            gross_out = (
-                desired_out * SATURNSWAP_BPS_DENOMINATOR
-                + (SATURNSWAP_BPS_DENOMINATOR - fee_bps)
-                - 1
-            ) // (SATURNSWAP_BPS_DENOMINATOR - fee_bps)
-            in_qty = (gross_out * num + denom - 1) // denom
-            return Assets(**{self.in_unit: int(in_qty)}), 0
-
-        desired_out = min(desired_out, int(self.order_datum.amount_buy))
-        gross_out = (
-            desired_out * SATURNSWAP_BPS_DENOMINATOR
-            + (SATURNSWAP_BPS_DENOMINATOR - fee_bps)
-            - 1
-        ) // (SATURNSWAP_BPS_DENOMINATOR - fee_bps)
-        in_qty = (gross_out * denom + num - 1) // num
-        return Assets(**{self.out_unit: int(in_qty)}), 0
+        desired_out = min(desired_out, int(self.order_datum.amount_sell))
+        gross_out = (desired_out * 10_000 + (10_000 - fee_bps) - 1) // (
+            10_000 - fee_bps
+        )
+        in_qty = (gross_out * num + denom - 1) // denom
+        return Assets(**{self.in_unit: int(in_qty)}), 0
 
     @property
     def available(self) -> Assets:
@@ -383,15 +402,7 @@ class SaturnSwapOrderState(AbstractOrderState):
         datum_target: PlutusData | None = None,
     ) -> tuple[TransactionOutput | None, PlutusData]:
         """Build swap transaction outputs and redeemer for this order."""
-        # TODO: preselect wallet inputs to keep redeemer input_index stable
         two_ada = 2_000_000
-        if not tx_builder.inputs:
-            utxos = list(tx_builder.context.utxos(address_source))
-            if utxos:
-                utxos.sort(key=lambda u: u.output.amount.coin, reverse=True)
-                tx_builder.add_input(utxos[0])
-                if address_source in tx_builder.input_addresses:
-                    tx_builder.input_addresses.remove(address_source)
 
         if self.reference_utxo is not None:
             tx_builder.reference_inputs.add(self.reference_utxo)
@@ -416,6 +427,7 @@ class SaturnSwapOrderState(AbstractOrderState):
                 datum_hash=self.order_datum.hash(),
             ),
         )
+        script_input_lovelace = input_utxo.output.amount.coin
 
         # Build output reference for payment datum
         output_ref = SaturnSwapOutputReference(
@@ -429,15 +441,13 @@ class SaturnSwapOrderState(AbstractOrderState):
         # Determine partial fill
         partial = user_sell_amount < self.order_datum.amount_buy
 
-        # Owner payment output (buy asset)
-        owner_address = _address_from_plutus(self.order_datum.owner)
-        owner_assets = Assets(**{self.in_unit: user_sell_amount})
+        sell_unit = out_assets.unit()
+        buy_unit = in_assets.unit()
+        sell_is_ada = sell_unit == "lovelace"
 
-        # If sell asset is ADA and a buffer is needed, include in owner output.
-        sell_is_ada = (
-            self.order_datum.policy_id_sell == b""
-            and self.order_datum.asset_name_sell == b""
-        )
+        # Owner payment output (buy asset)
+        owner_address = self.order_datum.owner.to_address()
+        owner_assets = Assets(**{buy_unit: user_sell_amount})
         new_amount_sell = _ratio_amount(
             self.order_datum.amount_buy,
             user_sell_amount,
@@ -447,8 +457,13 @@ class SaturnSwapOrderState(AbstractOrderState):
             owner_assets.root["lovelace"] = (
                 owner_assets.root.get("lovelace", 0) + two_ada
             )
+        elif not partial and not sell_is_ada:
+            # Full fill when maker is selling a token:
+            # owner must receive buy amount plus original script lovelace.
+            owner_assets.root["lovelace"] = (
+                owner_assets.root.get("lovelace", 0) + script_input_lovelace
+            )
 
-        owner_output_index = len(tx_builder.outputs)
         owner_output = TransactionOutput(
             address=owner_address,
             amount=asset_to_value(owner_assets),
@@ -461,9 +476,12 @@ class SaturnSwapOrderState(AbstractOrderState):
         tx_builder.add_output(owner_output)
 
         # Fee output (sell asset)
-        fee_address = Address.decode(SATURNSWAP_FEE_ADDRESS)
-        fee_amount = (new_amount_sell * self.volume_fee) // SATURNSWAP_BPS_DENOMINATOR
-        fee_assets = Assets(**{self.out_unit: fee_amount})
+        fee_address = Address.decode(
+            "addr1q8x4rlqhrq4rhqhnkamw3fdqmzqgum79yragg4gptcjpph"
+            "mrc2rpt0exfch4s47fu32amr45vh9wg053hmcx9k7kkcrq6kxftd",
+        )
+        fee_amount = (new_amount_sell * self.volume_fee) // 10_000
+        fee_assets = Assets(**{sell_unit: fee_amount})
         fee_output = TransactionOutput(
             address=fee_address,
             amount=asset_to_value(fee_assets),
@@ -475,15 +493,13 @@ class SaturnSwapOrderState(AbstractOrderState):
         )
         tx_builder.add_output(fee_output)
 
-        # Redeemer uses input and owner-output indices. Inputs are sorted by txid/index.
-        input_index = _redeemer_input_index(tx_builder, input_utxo)
-        redeemer = Redeemer(
-            SaturnSwapSwapAction(
-                user_sell_amount=user_sell_amount,
-                input_index=input_index,
-                output_index=owner_output_index,
-            ),
+        # Redeemer uses input and owner-output indices.
+        action = SaturnSwapSwapAction(
+            user_sell_amount=user_sell_amount,
+            input_index=0,
+            output_index=0,
         )
+        redeemer = Redeemer(action)
 
         tx_builder.add_script_input(
             utxo=input_utxo,
@@ -523,16 +539,22 @@ class SaturnSwapOrderState(AbstractOrderState):
                 output_reference=output_ref,
             )
 
-            residual_assets = Assets(**{self.out_unit: corrected_new_amount_sell})
+            residual_assets = Assets(**{sell_unit: corrected_new_amount_sell})
             residual_output = TransactionOutput(
                 address=order_address,
                 amount=asset_to_value(residual_assets),
                 datum=new_datum,
             )
-            residual_output.amount.coin = max(
-                residual_output.amount.coin,
-                min_lovelace(tx_builder.context, output=residual_output),
-            )
+            if sell_is_ada:
+                residual_output.amount.coin = max(
+                    residual_output.amount.coin,
+                    min_lovelace(tx_builder.context, output=residual_output),
+                )
+            else:
+                residual_output.amount.coin = max(
+                    script_input_lovelace,
+                    min_lovelace(tx_builder.context, output=residual_output),
+                )
             tx_builder.datums.update({new_datum.hash(): new_datum})
             return residual_output, new_datum
 
@@ -560,17 +582,12 @@ class SaturnSwapOrderBook(AbstractOrderBookState):
                 historical=False,
                 **selector.model_dump(),
             )
-            # Skip invalid/non-order datums
+            # Skip invalid/non-order datums that fail deserialization
             orders = []
             for r in result:
                 try:
                     orders.append(SaturnSwapOrderState.model_validate(r.model_dump()))
-                except (DeserializeException, ValidationError, TypeError, ValueError):
-                    tx_hash = getattr(r, "tx_hash", None)
-                    logger.info(
-                        "Skipping invalid order datum%s",
-                        f" (tx_hash={tx_hash})" if tx_hash else "",
-                    )
+                except NotAPoolError:
                     continue
 
         buy_orders: list[OrderBookOrder] = []
@@ -830,34 +847,3 @@ def _ratio_amount(old_token_amount: int, new_token_amount: int, old_amount: int)
     scale = 1_000_000_000_000
     ratio = (new_token_amount * scale + old_token_amount - 1) // old_token_amount
     return (old_amount * ratio + scale - 1) // scale
-
-
-def _redeemer_input_index(builder: TransactionBuilder, script_utxo: UTxO) -> int:
-    """Return the input index for the script UTxO after tx sorting."""
-    inputs_for_index = [*list(builder.inputs), script_utxo]
-    inputs_for_index.sort(
-        key=lambda u: (str(u.input.transaction_id), u.input.index),
-    )
-    return next(
-        i for i, u in enumerate(inputs_for_index) if u.input == script_utxo.input
-    )
-
-
-def _address_from_plutus(owner: PlutusFullAddress) -> Address:
-    """Convert a PlutusFullAddress into a pycardano Address."""
-
-    def _cred_hash(
-        part: PlutusPartAddress | PlutusScriptPartAddress,
-    ) -> ScriptHash | VerificationKeyHash:
-        if isinstance(part, PlutusScriptPartAddress):
-            return ScriptHash(part.address[:28])
-        return VerificationKeyHash(part.address[:28])
-
-    payment_part = _cred_hash(owner.payment)
-
-    if owner.stake is None or isinstance(owner.stake, PlutusNone):
-        stake_part = None
-    else:
-        stake_part = _cred_hash(owner.stake.wrapped.wrapped)
-
-    return Address(payment_part=payment_part, staking_part=stake_part)
