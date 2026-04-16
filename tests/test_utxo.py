@@ -1,5 +1,4 @@
 import os
-import time
 from typing import Type
 
 import pytest
@@ -277,3 +276,67 @@ def test_build_djed_shen_utxo(book_cls, side, backend):
         if "reserve ratio" in str(e):
             pytest.xfail(f"Reserve ratio out of range: {e}")
         raise
+
+
+def test_orderbook_utxo(dex: Type[AbstractPoolState], backend):
+    if not issubclass(dex, AbstractOrderBookState):
+        return
+
+    if dex in [DjedOrderBook, ShenOrderBook]:
+        return
+
+    set_backend(backend)
+    selector = dex.pool_selector()
+    result = get_backend().get_pool_utxos(
+        limit=10,
+        historical=False,
+        **selector.model_dump(),
+    )
+
+    if not result:
+        pytest.skip(f"No orders found for {dex.__name__}")
+
+    # Use the first sampled non-ADA token and skip if it's not executable.
+    # Exclude beacon/NFT tokens whose policy matches the dex_policy.
+    dex_policies = dex.dex_policy() or []
+    token = None
+    for record in result:
+        assets = (
+            record.assets
+            if isinstance(record.assets, Assets)
+            else Assets.model_validate(record.assets)
+        )
+        token = next(
+            (
+                unit
+                for unit in assets
+                if unit != "lovelace"
+                and not any(unit.startswith(p) for p in dex_policies)
+            ),
+            None,
+        )
+        if token is not None:
+            break
+
+    if token is None:
+        pytest.skip(f"No non-ADA assets found in recent orders for {dex.__name__}")
+
+    pair_assets = Assets(lovelace=0) + Assets(**{token: 0})
+    book = dex.get_book(assets=pair_assets)
+    if len(book.sell_book_full) == 0 and len(book.buy_book_full) == 0:
+        pytest.skip(f"No executable liquidity for {token}/ADA in {dex.__name__}")
+
+    in_assets = Assets(root={"lovelace": 1_000_000})
+    out_assets, _ = book.get_amount_out(in_assets)
+    assert out_assets.quantity() > 0, f"Expected positive output for {dex.__name__}"
+
+    tx_builder = TransactionBuilder(context)
+    txo, datum = book.swap_utxo(
+        address_source=ADDRESS,
+        in_assets=in_assets,
+        out_assets=out_assets,
+        tx_builder=tx_builder,
+    )
+
+    assert txo is not None
+    assert datum is not None
